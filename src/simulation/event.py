@@ -60,15 +60,17 @@ class Event:
         - If timestamps are equal, you might want to break ties by event_type
           (e.g., JOB_ARRIVAL before JOB_COMPLETION)
         """
+        if self.timestamp < other.timestamp:
+            return True
+        if self.timestamp > other.timestamp:
+            return False
         
+        priority_order = ["simulation_start", "job_arrival", "job_completion", "simulation_end"]
+        return priority_order.index(self.event_type) < priority_order.index(other.event_type)
     
     def __repr__(self) -> str:
         """
         String representation.
-        
-        TODO:
-        - Return something like:
-          "Event(type=JOB_ARRIVAL, time=100.5, job=job_001)"
         """
-        pass
+        return f"Event(type={self.event_type.upper()}, time={self.timestamp}, job={self.data['job'].get_state()['job_id'] if self.data.get("job") else "None"})"
 

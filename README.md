@@ -22,8 +22,8 @@ gpu-scheduler/
 
 ### Week 1: Foundation & Environment
 - [x] Project structure setup
-- [ ] Core data models (Job, GPU, Cluster)
-- [ ] Event system foundation
+- [x] Core data models (Job, GPU, Cluster)
+- [x] Event system foundation
 - [ ] Discrete event simulator
 - [ ] Baseline schedulers (FIFO, priority-based)
 - [ ] MDP environment interface (Gym-style)

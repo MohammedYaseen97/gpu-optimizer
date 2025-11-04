@@ -13,38 +13,6 @@ from .job import Job
 class Cluster:
     """
     Represents a cluster of GPUs.
-    
-    Attributes you should implement:
-    ----------
-    gpus : List[GPU]
-        List of GPU objects in the cluster
-    total_gpus : int
-        Total number of GPUs in the cluster
-    
-    Methods you should implement:
-    ----------
-    __init__(num_gpus: int)
-        Create a cluster with num_gpus GPUs
-    
-    get_idle_gpus() -> List[GPU]
-        Return list of all idle GPU objects
-    
-    get_idle_count() -> int
-        Return count of idle GPUs
-    
-    get_busy_count() -> int
-        Return count of busy GPUs
-    
-    assign_job(job: Job) -> bool
-        Try to assign a single job to GPUs. Return True if successful.
-        Note: If a job requires multiple GPUs, you need to assign it to multiple GPUs.
-        Use job.required_gpus to know how many GPUs are needed.
-    
-    release_job(job: Job) -> None
-        Release all GPUs assigned to a given job
-    
-    get_state() -> dict
-        Return dictionary with cluster state
     """
     
     def __init__(self, num_gpus: int):
@@ -100,10 +68,6 @@ class Cluster:
     def get_state(self) -> dict:
         """
         Get current state of the cluster.
-        
-        TODO:
-        - Return dict with: total_gpus, idle_count, busy_count, 
-          list of GPU states
         """
         return {
             "total_gpus": self.total_gpus,
@@ -115,9 +79,6 @@ class Cluster:
     def __repr__(self) -> str:
         """
         String representation.
-        
-        TODO:
-        - Return something like "Cluster(gpus=8, idle=3, busy=5)"
         """
         return f"Cluster(gpus={self.total_gpus}, idle={self.get_idle_count()}, busy={self.get_busy_count()})"
 
