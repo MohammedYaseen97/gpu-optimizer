@@ -163,14 +163,6 @@ class Simulator:
         
         NOTE: The job was already removed from job_queue when it was scheduled.
         This just releases GPUs and updates completion metrics.
-        
-        TODO:
-        - Extract job from event.data["job"]
-        - Release GPUs: cluster.release_job(job)
-        - Mark job complete: job.complete_job(self.current_time)
-        - Update metrics:
-          * jobs_completed += 1
-          * If job.start_time exists: total_wait_time += (start_time - submission_time)
         """
         job = event.data["job"]
         self.cluster.release_jobs()
@@ -246,14 +238,6 @@ class Simulator:
         - total_wait_time: Sum of wait times
         - avg_wait_time: Average wait time
         - gpu_utilization: Fraction of time GPUs were busy
-        
-        TODO:
-        - Calculate current queue_length = len(self.job_queue)
-        - Calculate avg_wait_time = total_wait_time / jobs_completed (if jobs_completed > 0, else 0)
-        - Calculate gpu_utilization:
-          * If current_time > 0: gpu_busy_time / (cluster.total_gpus * current_time)
-          * Else: 0.0
-        - Return dict with all metrics
         """
         return {
             "queue_length": len(self.job_queue),
