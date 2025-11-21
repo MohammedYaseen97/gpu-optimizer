@@ -81,4 +81,12 @@ class Cluster:
         String representation.
         """
         return f"Cluster(gpus={self.total_gpus}, idle={self.get_idle_count()}, busy={self.get_busy_count()})"
+    
+    def reset(self) -> None:
+        """
+        Reset the cluster forcefully, releasing all jobs.
+        """
+        for gpu in self.gpus:
+            gpu.release_job()
+
 

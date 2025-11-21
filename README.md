@@ -34,17 +34,17 @@ gpu-scheduler/
 ### Week 1: Foundations + Environment
 **Learning (Lane B):**
 - [x] Spinning Up: Intro + Key Concepts
-- [ ] HF Course: Unit 0 (Introduction) → Unit 1 (Foundations of Deep RL)
-- [ ] David Silver: Lectures 1-2 (MDPs & Value Functions)
+- [x] HF Course: Unit 0 (Introduction) → Unit 1 (Foundations of Deep RL)
+- [x] David Silver: Lectures 1-2 (MDPs & Value Functions)
 
 **Project (Lane A):**
 - [x] Project structure setup
 - [x] Core data models (Job, GPU, Cluster)
 - [x] Event system foundation
-- [ ] Design environment spec (state → action → reward)
-- [ ] Implement basic simulator (SimPy or Gymnasium)
+- [x] Design environment spec (state → action → reward)
+- [ ] Implement basic simulator (discrete event simulator)
+- [ ] MDP environment interface (Gymnasium)
 - [ ] Validate with random policy / trivial heuristic
-- [ ] MDP environment interface (Gym-style)
 
 🎯 **End-of-week goal:** Can describe simulator as an MDP and identify state, action, reward, and transition.
 

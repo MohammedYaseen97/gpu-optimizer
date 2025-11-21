@@ -54,11 +54,6 @@ class Event:
     def __lt__(self, other: 'Event') -> bool:
         """
         Less-than comparison for priority queue.
-        
-        TODO:
-        - Compare by timestamp (earlier timestamp = smaller)
-        - If timestamps are equal, you might want to break ties by event_type
-          (e.g., JOB_ARRIVAL before JOB_COMPLETION)
         """
         if self.timestamp < other.timestamp:
             return True
