@@ -59,13 +59,24 @@ class Event:
             return True
         if self.timestamp > other.timestamp:
             return False
-        
-        priority_order = ["simulation_start", "job_arrival", "job_completion", "simulation_end"]
+
+        # Tie-breaker on event type to have a deterministic ordering when
+        # timestamps are equal.
+        priority_order = [
+            EventType.SIMULATION_START,
+            EventType.JOB_ARRIVAL,
+            EventType.JOB_COMPLETION,
+            EventType.SIMULATION_END,
+        ]
         return priority_order.index(self.event_type) < priority_order.index(other.event_type)
     
     def __repr__(self) -> str:
         """
         String representation.
         """
-        return f"Event(type={self.event_type.upper()}, time={self.timestamp}, job={self.data['job'].get_state()['job_id'] if self.data.get("job") else "None"})"
+        job_id = None
+        job = self.data.get("job")
+        if job is not None and hasattr(job, "get_state"):
+            job_id = job.get_state().get("job_id")
+        return f"Event(type={self.event_type}, time={self.timestamp}, job={job_id})"
 

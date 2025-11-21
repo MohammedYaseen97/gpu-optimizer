@@ -36,9 +36,10 @@ class GPU:
         """
         Release the current job from this GPU.
         """
-        if self.current_job:
-            released_job = self.current_job
-        
+        if self.current_job is None:
+            return None
+
+        released_job = self.current_job
         self.current_job = None
         self.status = "idle"
         return released_job

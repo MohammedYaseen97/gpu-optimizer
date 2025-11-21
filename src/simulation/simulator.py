@@ -29,7 +29,7 @@ FLOW:
 """
 
 import heapq
-from typing import List, Optional, Callable, Dict
+from typing import List, Optional, Callable, Dict, Tuple
 from .event import Event, EventType
 from ..environment.job import Job
 from ..environment.cluster import Cluster
@@ -73,9 +73,10 @@ class Simulator:
             "jobs_completed": 0,
             "total_jobs": 0,
             "total_wait_time": 0.0,
-            "gpu_busy_time": 0.0
+            "gpu_busy_time": 0.0,
         }
-        self.max_time = max_time,
+        # Simulation horizon (in simulated time units)
+        self.max_time = max_time
         self.job_arrival_generator = job_arrival_generator
  
     
@@ -165,14 +166,16 @@ class Simulator:
         This just releases GPUs and updates completion metrics.
         """
         job = event.data["job"]
-        self.cluster.release_jobs()
-        
+        # Release all GPUs running this job
+        self.cluster.release_job(job)
+
+        # Update job timing and metrics
         job.complete_job(self.current_time)
-        
-        self.metrics.jobs_completed += 1
-        if job.start_time:
-            self.metrics.total_wait_time += (job.start_time - job.submission_time)
-        
+
+        self.metrics["jobs_completed"] += 1
+        if job.start_time is not None:
+            self.metrics["total_wait_time"] += (job.start_time - job.submission_time)
+
         return
     
     
@@ -185,35 +188,45 @@ class Simulator:
         return
     
     
-    def step(self) -> bool:
+    def step(self) -> Tuple[bool, List[Job]]:
         """
         Process one event (one simulation step).
         
         This advances time and processes the next event.
         
-        Returns:
+        Returns
         -------
-        bool
+        continue_simulation : bool
             True if simulation should continue, False if done
+        completed_jobs : List[Job]
+            Jobs that completed during processing of this event (usually 0 or 1)
         
         NOTE: This does NOT schedule jobs - that's done by agent via schedule_job()
         """
+        completed_jobs: List[Job] = []
+
         event = self.get_next_event()
         if not event:
-            return False
+            return False, completed_jobs
         
         self.advance_time(event.timestamp)
         match event.event_type:
             case EventType.JOB_ARRIVAL:
                 self.handle_job_arrival(event)
             case EventType.JOB_COMPLETION:
+                # Track which job completed this step so the environment
+                # can compute rewards without looking into the event queue.
+                job = event.data.get("job")
+                if isinstance(job, Job):
+                    completed_jobs.append(job)
                 self.handle_job_completion(event)
             case EventType.SIMULATION_END:
-                return False
+                return False, completed_jobs
         
         if self.current_time >= self.max_time:
-            return False
-        return True
+            return False, completed_jobs
+
+        return True, completed_jobs
     
     
     def run(self, until_time: Optional[float] = None) -> None:
@@ -222,7 +235,9 @@ class Simulator:
         """
         continue_simulation = True
         while continue_simulation:
-            continue_simulation = self.step() if (not until_time or self.current_time < until_time) else False
+            if until_time and self.current_time >= until_time:
+                break
+            continue_simulation, _ = self.step()
         return
     
     
@@ -238,25 +253,29 @@ class Simulator:
         - avg_wait_time: Average wait time
         - gpu_utilization: Fraction of time GPUs were busy
         """
+        jobs_completed = self.metrics["jobs_completed"]
+        total_jobs = self.metrics["total_jobs"]
+        total_wait_time = self.metrics["total_wait_time"]
+        gpu_busy_time = self.metrics["gpu_busy_time"]
+
+        avg_wait_time = total_wait_time / jobs_completed if jobs_completed > 0 else 0.0
+        if self.current_time > 0:
+            gpu_utilization = gpu_busy_time / (self.cluster.total_gpus * self.current_time)
+        else:
+            gpu_utilization = 0.0
+
         return {
             "queue_length": len(self.job_queue),
-            "jobs_completed": self.metrics.jobs_completed,
-            "total_jobs": self.metrics.total_jobs,
-            "total_wait_time": self.metrics.total_wait_time,
-            "avg_wait_time": self.metrics.total_wait_time if self.metrics.jobs_completed else 0.0,
-            "gpu_utilization": (self.metrics.gpu_busy_time / (self.cluster.total_gpus * self.current_time)) if self.current_time else 0.0
+            "jobs_completed": jobs_completed,
+            "total_jobs": total_jobs,
+            "total_wait_time": total_wait_time,
+            "avg_wait_time": avg_wait_time,
+            "gpu_utilization": gpu_utilization,
         }
     
     def reset(self) -> None:
         """
         Reset simulator to initial state.
-        
-        TODO:
-        - Reset current_time = 0.0
-        - Clear event_queue (set to empty list)
-        - Clear job_queue (set to empty list)
-        - Reset all metrics to 0
-        - Note: Cluster reset might be needed (check if Cluster has reset method)
         """
         self.current_time = 0.0
         self.event_queue = []

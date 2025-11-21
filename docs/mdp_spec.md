@@ -50,7 +50,6 @@ state_dim = (max_queue_size * job_feature_dim) + cluster_feature_dim
 - `estimated_duration` (normalized: `duration / max_duration`)
 - `priority` (normalized: `priority / max_priority`)
 - `required_gpus` (normalized: `required_gpus / max_gpus_per_job`)
-- `user_id` (one-hot encoded or integer ID)
 - `submission_time` (normalized: `(current_time - submission_time) / max_episode_time`)
 
 **Cluster Feature Vector**:
@@ -59,7 +58,7 @@ state_dim = (max_queue_size * job_feature_dim) + cluster_feature_dim
 
 **Total State Dimension**:
 ```
-state_dim = (max_queue_size * 5) + 2
+state_dim = (max_queue_size * 4) + 2
 ```
 
 ### 2.3 Normalization

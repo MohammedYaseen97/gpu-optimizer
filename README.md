@@ -42,9 +42,9 @@ gpu-scheduler/
 - [x] Core data models (Job, GPU, Cluster)
 - [x] Event system foundation
 - [x] Design environment spec (state → action → reward)
-- [ ] Implement basic simulator (discrete event simulator)
-- [ ] MDP environment interface (Gymnasium)
-- [ ] Validate with random policy / trivial heuristic
+- [x] Implement basic simulator (discrete event simulator)
+- [x] MDP environment interface (Gymnasium)
+- [x] Validate with random policy / trivial heuristic
 
 🎯 **End-of-week goal:** Can describe simulator as an MDP and identify state, action, reward, and transition.
 

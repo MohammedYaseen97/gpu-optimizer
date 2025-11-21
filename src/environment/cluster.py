@@ -58,7 +58,10 @@ class Cluster:
         """
         Release all GPUs assigned to a given job.
         """
-        assigned_gpus = [gpu for gpu in self.gpus if gpu.get_state().current_job == job.job_id]
+        assigned_gpus = [
+            gpu for gpu in self.gpus
+            if gpu.get_state().get("current_job") == job.job_id
+        ]
         
         assert len(assigned_gpus) == job.required_gpus
         
