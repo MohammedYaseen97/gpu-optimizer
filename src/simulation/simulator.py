@@ -220,11 +220,10 @@ class Simulator:
         """
         Run simulation until specified time or until no more events.
         """
-        while True:
-            if not until_time or self.current_time < until_time:
-                continue_steps = self.step()
-            if not continue_steps:
-                break
+        continue_simulation = True
+        while continue_simulation:
+            continue_simulation = self.step() if (not until_time or self.current_time < until_time) else False
+        return
     
     
     def get_metrics(self) -> Dict:
