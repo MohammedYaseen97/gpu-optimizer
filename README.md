@@ -50,14 +50,14 @@ gpu-scheduler/
 
 ### Week 2: Baselines + Policy Gradient Intuition
 **Learning (Lane B):**
-- [ ] HF Course: Unit 2 (Q-Learning) → Unit 3 (Deep Q-Learning) → Unit 4 (Policy Gradient)
-- [ ] Spinning Up: REINFORCE & A2C concepts
-- [ ] David Silver: Lectures 3-4 (DP, Monte Carlo, Temporal Difference)
+- [x] HF Course: Unit 2 (Q-Learning) → Unit 3 (Deep Q-Learning) → Unit 4 (Policy Gradient)
+- [x] Spinning Up: REINFORCE & A2C concepts
+- [] David Silver: Lectures 3-4 (DP, Monte Carlo, Temporal Difference)
 
 **Project (Lane A):**
-- [ ] Implement heuristic baselines (FIFO, SJF, power-aware)
-- [ ] Instrument metrics: GPU utilization, job queue latency, energy
-- [ ] Build RL agent skeleton (policy net, env interface, reward logic)
+- [x] Implement heuristic baselines (FIFO, SJF, priority)
+- [~] Instrument metrics: GPU utilization, job queue latency (core stats wired; logging/export pending)
+- [x] Build RL agent skeleton (policy net, value net, base agent interface, reward logic)
 
 🎯 **End-of-week goal:** Understand why PPO needs advantages (A = Q − V) and have solid baseline numbers to beat.
 
