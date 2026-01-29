@@ -35,6 +35,11 @@ class SchedulerEnv(gym.Env):
         max_queue_size: int = 50,
         max_episode_steps: int = 2000,
         max_duration: float = 10000.0,
+        # Max simulated time horizon for an episode. This should generally be
+        # larger than `max_duration` (which is a normalization constant for job
+        # durations) because an episode may contain many jobs whose durations
+        # accumulate.
+        max_episode_time: float = 15000.0,
         max_priority: int = 10,
         **kwargs: Any,
     ):
@@ -42,12 +47,13 @@ class SchedulerEnv(gym.Env):
         Wire up the environment according to the MDP spec.
         """
         super().__init__()
-        self.simulator = Simulator(Cluster(num_gpus), max_time=max_duration)
+        self.simulator = Simulator(Cluster(num_gpus), max_time=max_episode_time)
         
         self.num_gpus = num_gpus
         self.max_queue_size = max_queue_size
         self.max_episode_steps = max_episode_steps
         self.max_duration = max_duration
+        self.max_episode_time = max_episode_time
         self.max_priority = max_priority
         
         self.state_dim = max_queue_size * 4 + 2
@@ -115,6 +121,16 @@ class SchedulerEnv(gym.Env):
             self.simulator.schedule_event(event)
             self.total_jobs_in_episode += 1
 
+        # Process all arrivals scheduled at the current time so the initial
+        # observation actually contains the initial queue (submission_time=0).
+        # Without this, the agent sees an empty queue at reset and arrivals
+        # trickle in one-per-step, inflating queue-penalty artifacts.
+        while (
+            self.simulator.event_queue
+            and self.simulator.event_queue[0].timestamp <= self.simulator.current_time
+        ):
+            self.simulator.step()
+
         return self._get_observation(), {"action_mask": self._get_action_mask()}
       
 
@@ -133,21 +149,23 @@ class SchedulerEnv(gym.Env):
         - Determine `terminated` (natural end) vs `truncated` (time limit)
         - Produce the next observation and an updated action mask in `info`
         """
+        # Interpret action safely using the action mask (treat invalid actions as no-op)
+        action_mask = self._get_action_mask()
+        if action < 0 or action >= len(action_mask) or (action > 0 and not action_mask[action]):
+            action = 0
+
         if action > 0:
             job_queue = self.simulator.get_job_queue()
-            job = job_queue[action - 1]
-            self.simulator.schedule_job(job)
-            self.total_jobs_in_episode += 1
+            if 0 <= (action - 1) < len(job_queue):
+                self.simulator.schedule_job(job_queue[action - 1])
 
-        continue_sim, completed_jobs = self.simulator.step()
+        # Advance the simulator by one event if any exist. If the event queue is
+        # empty, we do NOT treat that as an episode end by itself (it can happen
+        # if the agent keeps no-op'ing while jobs are waiting).
+        completed_jobs = []
+        if self.simulator.event_queue:
+            _, completed_jobs = self.simulator.step()
         job_completed = completed_jobs[0] if completed_jobs else None
-
-        # Check if simulator naturally ran out of events
-        simulator_done = not continue_sim
-
-        reward = self._calculate_reward(
-            job_completed=job_completed, episode_ended=simulator_done
-        )
 
         self.step_count += 1
 
@@ -158,9 +176,11 @@ class SchedulerEnv(gym.Env):
         terminated = job_queue_empty and no_busy_gpus
 
         # Truncation: episode cut short by limits (time/steps), not by natural end
-        time_limit_hit = self.simulator.current_time >= self.max_duration
+        time_limit_hit = self.simulator.current_time >= self.max_episode_time
         step_limit_hit = self.step_count >= self.max_episode_steps
         truncated = (time_limit_hit or step_limit_hit) and not terminated
+
+        reward = self._calculate_reward(job_completed=job_completed, episode_ended=terminated or truncated)
 
         obs = self._get_observation()
         info: Dict[str, Any] = {"action_mask": self._get_action_mask()}

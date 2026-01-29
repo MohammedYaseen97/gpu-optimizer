@@ -63,7 +63,9 @@ class FIFOScheduler:
         assert len(job_array) % 4 == 0
         len_jobs = len(job_array) // 4
 
-        max_waiting_time = 0.0  # normalized
+        # Start below any valid waiting time so FIFO picks a job even at t=0
+        # (when all waiting_time values are exactly 0.0).
+        max_waiting_time = -1.0  # normalized
         fifo_index = 0  # 0 = no-op
 
         for i in range(len_jobs):
