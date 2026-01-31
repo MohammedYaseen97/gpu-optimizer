@@ -72,7 +72,7 @@ class SJFScheduler:
         return sjf_index
 
 
-    def run_episode(self, max_steps: int = 100) -> float:
+    def run_episode(self, max_steps: Optional[int] = None) -> float:
         """
         Convenience helper to run one full episode with this scheduler.
 
@@ -81,7 +81,8 @@ class SJFScheduler:
         obs, info = self.env.reset()
         total_reward = 0.0
 
-        for _ in range(max_steps):
+        limit = int(max_steps) if max_steps is not None else int(self.env.max_episode_steps)
+        for _ in range(limit):
             action = self.select_action(obs)
             obs, reward, terminated, truncated, info = self.env.step(action)
             total_reward += reward

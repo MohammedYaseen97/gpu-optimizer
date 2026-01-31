@@ -11,7 +11,7 @@ It is responsible for:
 import gymnasium as gym
 from gymnasium import spaces
 import numpy as np
-from typing import Tuple, Dict, Any, Optional
+from typing import Tuple, Dict, Any, Optional, Literal
 
 from ..simulation.simulator import Simulator
 from ..simulation.event import Event, EventType
@@ -35,26 +35,49 @@ class SchedulerEnv(gym.Env):
         max_queue_size: int = 50,
         max_episode_steps: int = 2000,
         max_duration: float = 10000.0,
-        # Max simulated time horizon for an episode. This should generally be
-        # larger than `max_duration` (which is a normalization constant for job
-        # durations) because an episode may contain many jobs whose durations
-        # accumulate.
-        max_episode_time: float = 15000.0,
+        # --- workload scale ---
+        jobs_per_episode: int = 400,
+        arrival_mode: Literal["all_at_zero", "bursty"] = "bursty",
+        # Controls the time window over which jobs arrive (only for bursty mode).
+        # If None, defaults to `max_duration`.
+        arrival_span: Optional[float] = None,
+        # Bursty arrivals: mixture of k Gaussian bursts + uniform background.
+        num_bursts: int = 6,
+        burst_prob: float = 0.8,
+        burst_std_frac: float = 0.03,
+        # --- episode horizon ---
+        # If provided, uses a fixed max episode time horizon.
+        # If None, computes a per-episode horizon from the generated workload.
+        max_episode_time: Optional[float] = None,
+        horizon_factor: float = 1.3,
         max_priority: int = 10,
+        debug: bool = False,
         **kwargs: Any,
     ):
         """
         Wire up the environment according to the MDP spec.
         """
         super().__init__()
-        self.simulator = Simulator(Cluster(num_gpus), max_time=max_episode_time)
+
+        # The simulator max_time is set on each reset (workload-aware horizon).
+        self.simulator = Simulator(Cluster(num_gpus), max_time=1.0)
         
         self.num_gpus = num_gpus
         self.max_queue_size = max_queue_size
         self.max_episode_steps = max_episode_steps
         self.max_duration = max_duration
-        self.max_episode_time = max_episode_time
+        self._fixed_max_episode_time = max_episode_time
+        self.horizon_factor = horizon_factor
+        self.max_episode_time = 1.0  # populated at reset
         self.max_priority = max_priority
+
+        self.jobs_per_episode = jobs_per_episode
+        self.arrival_mode = arrival_mode
+        self.arrival_span = arrival_span if arrival_span is not None else max_duration
+        self.num_bursts = num_bursts
+        self.burst_prob = burst_prob
+        self.burst_std_frac = burst_std_frac
+        self.debug = debug
         
         self.state_dim = max_queue_size * 4 + 2
         self.observation_space = spaces.Box(
@@ -66,7 +89,7 @@ class SchedulerEnv(gym.Env):
         self.action_space = spaces.Discrete(self.max_queue_size + 1)
         
         self.step_count = 0
-        self.total_jobs_in_episode = 0
+        self.total_jobs_generated = 0
 
         return
 
@@ -93,33 +116,62 @@ class SchedulerEnv(gym.Env):
         self.simulator.reset()
 
         self.step_count = 0
-        self.total_jobs_in_episode = 0
 
-        # Simple initial workload: fixed number of jobs arriving at t=0
-        num_initial_jobs = 20
-        for j in range(num_initial_jobs):
-            submission_time = 0.0
-            estimated_duration = np.random.uniform(
-                low=self.max_duration * 0.05, high=self.max_duration * 0.2
-            )
-            priority = np.random.randint(1, self.max_priority + 1)
-            required_gpus = np.random.randint(1, min(4, self.num_gpus) + 1)
+        # --------- workload generation (jobs + arrivals) ---------------------
+        n = int(self.jobs_per_episode)
+        self.total_jobs_generated = n
 
+        # Durations are per-job; max_duration is a normalization constant.
+        durations = np.random.uniform(
+            low=self.max_duration * 0.05, high=self.max_duration * 0.2, size=n
+        )
+        priorities = np.random.randint(1, self.max_priority + 1, size=n)
+        required_gpus = np.random.randint(1, min(4, self.num_gpus) + 1, size=n)
+
+        if self.arrival_mode == "all_at_zero":
+            submission_times = np.zeros(n, dtype=np.float32)
+        else:
+            # Bursty: mixture of k Gaussian bursts + uniform background.
+            span = float(self.arrival_span)
+            centers = np.random.uniform(0.0, span, size=int(self.num_bursts))
+            std = max(1e-6, span * float(self.burst_std_frac))
+
+            choose_burst = np.random.rand(n) < float(self.burst_prob)
+            burst_ids = np.random.randint(0, len(centers), size=n)
+            burst_times = centers[burst_ids] + np.random.normal(0.0, std, size=n)
+            uniform_times = np.random.uniform(0.0, span, size=n)
+            submission_times = np.where(choose_burst, burst_times, uniform_times)
+            submission_times = np.clip(submission_times, 0.0, span).astype(np.float32)
+
+        # Schedule all arrivals into the simulator event queue.
+        for j in range(n):
             job = Job(
                 job_id=f"job_{j}",
-                submission_time=submission_time,
-                required_gpus=required_gpus,
-                estimated_duration=estimated_duration,
-                priority=priority,
+                submission_time=float(submission_times[j]),
+                required_gpus=int(required_gpus[j]),
+                estimated_duration=float(durations[j]),
+                priority=int(priorities[j]),
             )
 
-            event = Event(
-                event_type=EventType.JOB_ARRIVAL,
-                timestamp=submission_time,
-                data={"job": job},
+            self.simulator.schedule_event(
+                Event(
+                    event_type=EventType.JOB_ARRIVAL,
+                    timestamp=float(submission_times[j]),
+                    data={"job": job},
+                )
             )
-            self.simulator.schedule_event(event)
-            self.total_jobs_in_episode += 1
+
+        # --------- workload-aware max episode time horizon -------------------
+        if self._fixed_max_episode_time is not None:
+            self.max_episode_time = float(self._fixed_max_episode_time)
+        else:
+            # Lower bound on makespan from total GPU-time demand.
+            total_gpu_time = float(np.sum(durations * required_gpus))
+            lb = total_gpu_time / float(self.num_gpus)
+            last_arrival = float(np.max(submission_times)) if n > 0 else 0.0
+            self.max_episode_time = last_arrival + float(self.horizon_factor) * lb
+
+        self.simulator.max_time = self.max_episode_time
 
         # Process all arrivals scheduled at the current time so the initial
         # observation actually contains the initial queue (submission_time=0).
@@ -131,7 +183,11 @@ class SchedulerEnv(gym.Env):
         ):
             self.simulator.step()
 
-        return self._get_observation(), {"action_mask": self._get_action_mask()}
+        return self._get_observation(), {
+            "action_mask": self._get_action_mask(),
+            "max_episode_time": self.max_episode_time,
+            "total_jobs": self.total_jobs_generated,
+        }
       
 
     def step(self, action: int) -> Tuple[np.ndarray, float, bool, bool, Dict[str, Any]]:
@@ -169,21 +225,30 @@ class SchedulerEnv(gym.Env):
 
         self.step_count += 1
 
-        # Natural termination: no waiting jobs and no busy GPUs
+        # Natural termination: no waiting jobs, no busy GPUs, and no future events
+        # (important when using non-zero submission_time arrivals).
         job_queue_empty = len(self.simulator.get_job_queue()) == 0
         cluster_state = self.simulator.cluster.get_state()
         no_busy_gpus = cluster_state["busy_count"] == 0
-        terminated = job_queue_empty and no_busy_gpus
+        no_future_events = len(self.simulator.event_queue) == 0
+        terminated = job_queue_empty and no_busy_gpus and no_future_events
 
         # Truncation: episode cut short by limits (time/steps), not by natural end
         time_limit_hit = self.simulator.current_time >= self.max_episode_time
         step_limit_hit = self.step_count >= self.max_episode_steps
         truncated = (time_limit_hit or step_limit_hit) and not terminated
 
-        reward = self._calculate_reward(job_completed=job_completed, episode_ended=terminated or truncated)
+        reward, r_episode = self._calculate_reward(
+            job_completed=job_completed, episode_ended=terminated or truncated
+        )
 
         obs = self._get_observation()
-        info: Dict[str, Any] = {"action_mask": self._get_action_mask()}
+        info: Dict[str, Any] = {
+            "action_mask": self._get_action_mask(),
+            "max_episode_time": self.max_episode_time,
+        }
+        if terminated or truncated:
+            info["r_episode"] = r_episode
 
         return obs, reward, terminated, truncated, info
         
@@ -211,7 +276,11 @@ class SchedulerEnv(gym.Env):
             obs[base + 0] = job.estimated_duration / self.max_duration
             obs[base + 1] = job.priority / self.max_priority
             obs[base + 2] = job.required_gpus / self.num_gpus
-            obs[base + 3] = (self.simulator.current_time - job.submission_time) / self.max_duration
+            # Spec intent: waiting time normalized by episode horizon.
+            wt = (self.simulator.current_time - job.submission_time) / max(
+                1e-6, float(self.max_episode_time)
+            )
+            obs[base + 3] = np.clip(wt, 0.0, 1.0)
 
         idle_ratio = self.simulator.cluster.get_idle_count() / self.num_gpus
         busy_ratio = self.simulator.cluster.get_busy_count() / self.num_gpus
@@ -251,7 +320,7 @@ class SchedulerEnv(gym.Env):
         self,
         job_completed: Optional[Job] = None,
         episode_ended: bool = False,
-    ) -> float:
+    ) -> Tuple[float, float]:
         """
         Compute the scalar reward for the current step.
 
@@ -263,17 +332,32 @@ class SchedulerEnv(gym.Env):
         (e.g. which job finished, whether the episode just ended) and the
         arithmetic and weighting live here.
         """
-        r = -0.01 * len(self.simulator.get_job_queue()) # r_dense
+        # Dense queue penalty (scaled to be stable across episode sizes).
+        #
+        # Old behaviour (20-job episodes):
+        #   r_dense = -0.01 * queue_length
+        #   max queue penalty magnitude per step ≈ 0.2 (when queue_length≈20)
+        #
+        # Generalize by keeping the *max per-step penalty* at ~0.2 regardless of
+        # how many jobs are in the episode:
+        #   r_dense = -0.2 * (queue_length / total_jobs_generated)
+        denom = max(1, int(self.total_jobs_generated))
+        r = -0.2 * (len(self.simulator.get_job_queue()) / float(denom))
+        r_episode = 0.0
         
         if job_completed:
-          r += 1.0 # r_completion
-          r += 0.1 * (job_completed.get_state()["priority"]/self.max_priority) # r_priority
+            r += 1.0  # r_completion
+            r += 0.1 * (
+                job_completed.get_state()["priority"] / self.max_priority
+            )  # r_priority
         
         if episode_ended:
-          metrics = self.simulator.get_metrics()
-          r += 10.0 * (metrics["jobs_completed"]/metrics["total_jobs"]) # r_episode
+            metrics = self.simulator.get_metrics()
+            completion_rate = float(metrics["jobs_completed"]) / float(denom)
+            r_episode = 10.0 * completion_rate
+            r += r_episode
         
-        return r
+        return r, r_episode
 
     def render(self) -> None:
         """

@@ -1,7 +1,9 @@
 """PPO agent implementation for `SchedulerEnv`."""
 
 from dataclasses import dataclass
-from typing import Dict, Any, Tuple
+from typing import Dict, Any, Tuple, Optional, List
+import csv
+import os
 
 import numpy as np
 import torch
@@ -69,12 +71,13 @@ class PPOAgent(BaseAgent):
 
         return int(action.item())
 
-    def run_episode(self, max_steps: int = 100) -> float:
+    def run_episode(self, max_steps: Optional[int] = None) -> float:
         """Run one evaluation episode using the current policy and action mask."""
         obs, info = self.env.reset()
         total_reward = 0.0
 
-        for _ in range(max_steps):
+        limit = int(max_steps) if max_steps is not None else int(self.env.max_episode_steps)
+        for _ in range(limit):
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
             mask_t = torch.as_tensor(info["action_mask"], dtype=torch.bool, device=self.device)
 
@@ -95,7 +98,11 @@ class PPOAgent(BaseAgent):
     # ---- Rollout collection -------------------------------------------------
 
     def _collect_rollout(self) -> Dict[str, torch.Tensor]:
-        """Collect one on-policy rollout of length `config.num_steps`."""
+        """Collect one on-policy rollout of length `config.num_steps`.
+
+        Also tracks any completed episodes encountered during collection so
+        training can log episodic returns (more meaningful than raw loss curves).
+        """
 
         # ---------------- utility function to get action, logprob, value --
 
@@ -138,6 +145,11 @@ class PPOAgent(BaseAgent):
         next_obs, next_info = self.env.reset()
         next_done = torch.tensor(0.0, dtype=torch.float32, device=self.device)
 
+        ep_returns: List[float] = []
+        ep_lengths: List[int] = []
+        running_return = 0.0
+        running_len = 0
+
         for step in range(config.num_steps):
             next_obs_t = torch.as_tensor(next_obs, dtype=torch.float32, device=self.device)
             obs[step] = next_obs_t
@@ -160,7 +172,14 @@ class PPOAgent(BaseAgent):
                 float(np.logical_or(terminated, truncated)), dtype=torch.float32, device=self.device
             )
 
+            running_return += float(reward)
+            running_len += 1
+
             if next_done.item():
+                ep_returns.append(running_return)
+                ep_lengths.append(running_len)
+                running_return = 0.0
+                running_len = 0
                 next_obs, next_info = self.env.reset()
 
         # Bootstrap value for last state
@@ -178,6 +197,8 @@ class PPOAgent(BaseAgent):
             "values": values,
             "last_value": next_value,
             "last_done": next_done,
+            "ep_returns": ep_returns,
+            "ep_lengths": ep_lengths,
         }
         
     # ---- Advantage and return computation -----------------------------------
@@ -291,10 +312,47 @@ class PPOAgent(BaseAgent):
         
     # ---- High-level training loop ------------------------------------------
 
-    def train(self) -> None:
-        """Main training loop: rollouts → advantages → PPO updates with logging."""
+    def train(
+        self,
+        log_csv_path: Optional[str] = None,
+        eval_interval_updates: int = 0,
+        eval_episodes: int = 0,
+    ) -> None:
+        """Main training loop: rollouts → advantages → PPO updates with logging.
+
+        If `log_csv_path` is provided, appends per-update stats including
+        mean episodic return observed during rollout collection.
+
+        If `eval_interval_updates > 0`, runs evaluation every N updates and logs
+        `eval_mean_return` (this is usually the most interpretable learning curve
+        for long episodes where rollouts may not contain full episode terminations).
+        """
         total_timesteps = 0
         update_idx = 0
+
+        csv_file = None
+        csv_writer = None
+        if log_csv_path is not None:
+            os.makedirs(os.path.dirname(log_csv_path) or ".", exist_ok=True)
+            file_exists = os.path.exists(log_csv_path)
+            csv_file = open(log_csv_path, "a", newline="")
+            csv_writer = csv.DictWriter(
+                csv_file,
+                fieldnames=[
+                    "update",
+                    "timesteps",
+                    "mean_ep_return",
+                    "mean_ep_length",
+                    "num_episodes",
+                    "eval_mean_return",
+                    "loss",
+                    "pg_loss",
+                    "v_loss",
+                    "entropy",
+                ],
+            )
+            if not file_exists:
+                csv_writer.writeheader()
 
         while total_timesteps < self.config.total_timesteps:
             rollout_batch = self._collect_rollout()
@@ -305,11 +363,41 @@ class PPOAgent(BaseAgent):
             total_timesteps += self.config.num_steps
             update_idx += 1
 
+            ep_returns = rollout_batch.get("ep_returns", [])
+            ep_lengths = rollout_batch.get("ep_lengths", [])
+            mean_ep_return = float(np.mean(ep_returns)) if len(ep_returns) > 0 else float("nan")
+            mean_ep_length = float(np.mean(ep_lengths)) if len(ep_lengths) > 0 else float("nan")
+
             # Simple logging so you can see training behaviour
             print(
                 f"[PPO] update={update_idx}  timesteps={total_timesteps}  "
                 f"loss={stats['loss']:.3f}  pg={stats['pg_loss']:.3f}  "
                 f"v={stats['v_loss']:.3f}  ent={stats['entropy_loss']:.3f}"
             )
+
+            if csv_writer is not None:
+                eval_mean_return = float("nan")
+                if eval_interval_updates and eval_episodes and (update_idx % eval_interval_updates == 0):
+                    eval_rewards = [self.run_episode() for _ in range(int(eval_episodes))]
+                    eval_mean_return = float(np.mean(eval_rewards))
+
+                csv_writer.writerow(
+                    {
+                        "update": update_idx,
+                        "timesteps": total_timesteps,
+                        "mean_ep_return": mean_ep_return,
+                        "mean_ep_length": mean_ep_length,
+                        "num_episodes": len(ep_returns),
+                        "eval_mean_return": eval_mean_return,
+                        "loss": stats["loss"],
+                        "pg_loss": stats["pg_loss"],
+                        "v_loss": stats["v_loss"],
+                        "entropy": stats["entropy_loss"],
+                    }
+                )
+                csv_file.flush()
+
+        if csv_file is not None:
+            csv_file.close()
 
 

@@ -6,7 +6,7 @@ so that evaluation scripts can treat them uniformly.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any
+from typing import Any, Optional
 
 from src.environment.scheduler_env import SchedulerEnv
 
@@ -41,7 +41,7 @@ class BaseAgent(ABC):
         """
         return None
 
-    def run_episode(self, max_steps: int = 100) -> float:
+    def run_episode(self, max_steps: Optional[int] = None) -> float:
         """
         Convenience method to run one full episode with this agent.
 
@@ -50,7 +50,8 @@ class BaseAgent(ABC):
         obs, info = self.env.reset()
         total_reward = 0.0
 
-        for _ in range(max_steps):
+        limit = int(max_steps) if max_steps is not None else int(self.env.max_episode_steps)
+        for _ in range(limit):
             action = self.select_action(obs)
             obs, reward, terminated, truncated, info = self.env.step(action)
             total_reward += reward

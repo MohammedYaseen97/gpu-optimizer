@@ -10,6 +10,8 @@ You will fill in the PPOAgent internals in `src/agents/ppo_agent.py`.
 """
 
 import argparse
+import os
+from datetime import datetime
 import numpy as np
 import torch
 
@@ -19,7 +21,8 @@ from src.agents.ppo_agent import PPOAgent, PPOConfig
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--total-timesteps", type=int, default=100_000)
+    # Training
+    parser.add_argument("--total-timesteps", type=int, default=200_000)
     parser.add_argument("--num-steps", type=int, default=256)
     parser.add_argument("--gamma", type=float, default=0.99)
     parser.add_argument("--gae-lambda", type=float, default=0.95)
@@ -32,6 +35,28 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-grad-norm", type=float, default=0.5)
     parser.add_argument("--normalize-advantages", type=bool, default=True)
     parser.add_argument("--seed", type=int, default=1)
+
+    # Env config
+    parser.add_argument("--num-gpus", type=int, default=8)
+    parser.add_argument("--max-queue-size", type=int, default=50)
+    parser.add_argument("--max-episode-steps", type=int, default=2000)
+    parser.add_argument("--max-duration", type=float, default=10000.0)
+    parser.add_argument("--jobs-per-episode", type=int, default=400)
+    parser.add_argument(
+        "--arrival-mode",
+        type=str,
+        default="bursty",
+        choices=["all_at_zero", "bursty"],
+    )
+    parser.add_argument("--arrival-span", type=float, default=None)
+    parser.add_argument("--horizon-factor", type=float, default=1.3)
+
+    # Logging
+    parser.add_argument("--log-dir", type=str, default="runs")
+    parser.add_argument("--run-name", type=str, default=None)
+    parser.add_argument("--num-eval-episodes", type=int, default=10)
+    parser.add_argument("--eval-interval-updates", type=int, default=10)
+    parser.add_argument("--eval-episodes", type=int, default=3)
     return parser.parse_args()
 
 
@@ -43,7 +68,16 @@ def main() -> None:
     torch.manual_seed(args.seed)
 
     # Build env
-    env = SchedulerEnv()
+    env = SchedulerEnv(
+        num_gpus=args.num_gpus,
+        max_queue_size=args.max_queue_size,
+        max_episode_steps=args.max_episode_steps,
+        max_duration=args.max_duration,
+        jobs_per_episode=args.jobs_per_episode,
+        arrival_mode=args.arrival_mode,
+        arrival_span=args.arrival_span,
+        horizon_factor=args.horizon_factor,
+    )
 
     # Build PPOConfig from args
     config = PPOConfig(
@@ -63,11 +97,22 @@ def main() -> None:
 
     agent = PPOAgent(env, config)
 
+    os.makedirs(args.log_dir, exist_ok=True)
+    run_name = args.run_name
+    if run_name is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        run_name = f"ppo_{args.jobs_per_episode}jobs_w{args.max_queue_size}_seed{args.seed}_{ts}"
+    csv_path = os.path.join(args.log_dir, f"{run_name}.csv")
+
     # Train PPO
-    agent.train()
+    agent.train(
+        log_csv_path=csv_path,
+        eval_interval_updates=int(args.eval_interval_updates),
+        eval_episodes=int(args.eval_episodes),
+    )
 
     # Simple post-training evaluation
-    num_eval_episodes = 10
+    num_eval_episodes = int(args.num_eval_episodes)
     rewards = []
     for _ in range(num_eval_episodes):
         total_reward = agent.run_episode()
@@ -75,6 +120,7 @@ def main() -> None:
 
     avg_reward = float(np.mean(rewards))
     print(f"[PPO] Avg total reward over {num_eval_episodes} eval episodes: {avg_reward:.3f}")
+    print(f"[PPO] Training curve CSV: {csv_path}")
 
 
 if __name__ == "__main__":
