@@ -1,87 +1,118 @@
-# GPU Job Scheduler with Reinforcement Learning
+# GPU Scheduler (PPO vs Heuristics)
 
-A research project implementing an intelligent GPU job scheduler using Proximal Policy Optimization (PPO). The system learns optimal scheduling policies through reinforcement learning, balancing multiple objectives: maximizing throughput, minimizing wait times, ensuring fairness, and maximizing GPU utilization.
+This repo implements a **GPU job scheduling environment** (discrete-event simulation wrapped as a Gymnasium MDP), **heuristic baselines** (FIFO/SJF/Priority), and a **PPO agent** trained to learn scheduling policies.
 
-## Learning Resources
+This README focuses on **what the system is** and **how to run it**.  
+Results and ablations live in a separate markdown file (see `docs/`).
 
-This project follows a **parallel two-lane approach**:
-- **Lane A:** Project implementation (environment → baselines → RL)
-- **Lane B:** RL theory learning (in lockstep with implementation)
+---
 
-**Primary Resources:**
-- **Spinning Up in Deep RL** (OpenAI) - Core text with clear math + code
-- **Hugging Face Deep RL Course** (Units 0-4, 6, 8) - Hands-on implementation labs
-- **David Silver UCL Lectures** (1-5) - Deep conceptual intuition
-- **Sutton & Barto (2e)** - Reference only (optional lookup)
+## What’s implemented
 
-## Project Structure
+- **Environment**: `src/environment/scheduler_env.py`
+  - Observation: fixed window over the job queue + cluster features
+  - Action: choose a job index in the window (or no-op), with action masking
+  - Workloads: bursty arrivals; configurable job attribute distributions (including heavy-tailed durations + correlations)
+  - Truncation: per-episode time horizon (workload-aware) and/or step limit
+- **Baselines**: `src/agents/baselines/`
+  - FIFO, SJF, Priority heuristics
+- **PPO**: `src/agents/ppo_agent.py`, training script: `scripts/train_ppo.py`
+  - On-policy rollouts + clipped PPO update + value function
+  - CSV logging for learning curves + plotting script
+- **(Novelty-ready) Look-ahead signal**:
+  - Observation can include a vector of **per-GPU remaining busy time** (normalized), which helps the policy reason about near-future capacity.
 
-```
+---
+
+## Repo layout
+
+```text
 gpu-scheduler/
 ├── src/
-│   ├── environment/     # MDP environment and core entities
-│   ├── simulation/      # Discrete event simulation framework
-│   ├── agents/          # RL agents (PPO, baselines) - Week 2
-│   ├── utils/           # Utilities, metrics, visualization
-│   └── config/          # Configuration files
-├── tests/               # Unit tests
-├── notebooks/           # Exploratory analysis (optional)
-└── scripts/             # Training/evaluation scripts
+│   ├── environment/        # SchedulerEnv + Cluster/GPU/Job
+│   ├── simulation/         # Discrete event simulator
+│   ├── agents/             # PPO + baselines + networks
+│   └── utils/
+├── scripts/
+│   ├── evaluate_baselines.py
+│   ├── train_ppo.py
+│   └── plot_training_curve.py
+├── docs/
+│   └── mdp_spec.md
+└── runs/                   # Training CSVs/plots
 ```
 
-## Week-by-Week Progress
+---
 
-### Week 1: Foundations + Environment
-**Learning (Lane B):**
-- [x] Spinning Up: Intro + Key Concepts
-- [x] HF Course: Unit 0 (Introduction) → Unit 1 (Foundations of Deep RL)
-- [x] David Silver: Lectures 1-2 (MDPs & Value Functions)
+## Setup
 
-**Project (Lane A):**
-- [x] Project structure setup
-- [x] Core data models (Job, GPU, Cluster)
-- [x] Event system foundation
-- [x] Design environment spec (state → action → reward)
-- [x] Implement basic simulator (discrete event simulator)
-- [x] MDP environment interface (Gymnasium)
-- [x] Validate with random policy / trivial heuristic
+You already have a venv in this repo:
 
-🎯 **End-of-week goal:** Can describe simulator as an MDP and identify state, action, reward, and transition.
+```bash
+source virtual/bin/activate
+```
 
-### Week 2: Baselines + Policy Gradient Intuition
-**Learning (Lane B):**
-- [x] HF Course: Unit 2 (Q-Learning) → Unit 3 (Deep Q-Learning) → Unit 4 (Policy Gradient)
-- [x] Spinning Up: REINFORCE & A2C concepts
-- [] David Silver: Lectures 3-4 (DP, Monte Carlo, Temporal Difference)
+If you ever need dependencies:
 
-**Project (Lane A):**
-- [x] Implement heuristic baselines (FIFO, SJF, priority)
-- [~] Instrument metrics: GPU utilization, job queue latency (core stats wired; logging/export pending)
-- [x] Build RL agent skeleton (policy net, value net, base agent interface, reward logic)
+```bash
+pip install -r requirements.txt
+```
 
-🎯 **End-of-week goal:** Understand why PPO needs advantages (A = Q − V) and have solid baseline numbers to beat.
+All scripts assume running from repo root with `PYTHONPATH=.`:
 
-### Week 3: PPO Deep Dive + Novelty
-**Learning (Lane B):**
-- [ ] HF Course: Unit 6 (Actor-Critic) → Unit 8 (PPO)
-- [ ] Spinning Up: PPO section + implementation notes
-- [ ] David Silver: Lecture 5 (Policy Gradient Wrap-up)
+```bash
+PYTHONPATH=. python scripts/...
+```
 
-**Project (Lane A):**
-- [ ] Train PPO on environment; tune hyperparameters (clip ε, entropy coef, value coef)
-- [ ] Choose and implement one novelty:
-  - Hierarchical policy (job-class → GPU allocation), or
-  - Graph-encoded state (GNN over GPU nodes), or
-  - Adaptive reward weights (based on load/energy)
-- [ ] Evaluate vs baselines under steady/bursty/power-capped scenarios
-- [ ] Build Streamlit dashboard + README + demo GIF
+---
 
-🎯 **End-of-week goal:** PPO beats baselines on ≥ 2 KPIs and can clearly explain how novelty changes agent behavior.
+## Run baselines
 
-## Deliverables
+```bash
+source virtual/bin/activate
+PYTHONPATH=. python scripts/evaluate_baselines.py --num-episodes 10 --seed 1
+```
 
-1. Working environment + trained PPO agent outperforming baselines
-2. Own derivations of Bellman + PPO loss (in notes)
-3. One novelty implemented and evaluated wxith plots
-4. Public GitHub repo + dashboard + demo clip
+You can also override environment scale parameters (see `scripts/evaluate_baselines.py --help`), e.g.:
+
+```bash
+PYTHONPATH=. python scripts/evaluate_baselines.py \
+  --jobs-per-episode 400 \
+  --max-queue-size 50 \
+  --arrival-mode bursty \
+  --horizon-factor 1.25
+```
+
+---
+
+## Train PPO
+
+```bash
+source virtual/bin/activate
+PYTHONPATH=. python scripts/train_ppo.py \
+  --total-timesteps 200000 \
+  --jobs-per-episode 400 \
+  --max-queue-size 50 \
+  --arrival-mode bursty \
+  --horizon-factor 1.25 \
+  --run-name my_run
+```
+
+This will write a CSV to `runs/my_run.csv` with training stats and periodic eval returns.
+
+---
+
+## Plot training curves
+
+```bash
+source virtual/bin/activate
+PYTHONPATH=. python scripts/plot_training_curve.py runs/my_run.csv --out runs/my_run.png
+```
+
+---
+
+## Documentation
+
+- **MDP spec**: `docs/mdp_spec.md` (state/action/reward/termination, aligned to implementation)
+- **Results / ablations**: keep in a separate markdown file under `docs/` (not included in this README)
 

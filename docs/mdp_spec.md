@@ -1,9 +1,9 @@
 # MDP Specification: GPU Job Scheduler
 
-**Version:** 1.0  
-**Date:** 20 Nov 2025
+**Version:** 2.0  
+**Date:** 2026-02-03  
 **Author:** Yaseen  
-**Status:** Final
+**Status:** Updated to match implementation
 
 ---
 
@@ -30,12 +30,17 @@ The state space is a concatenated vector combining:
 1. **Job Queue Window** (Partially Observable)
    - Fixed-size sliding window of queued jobs
    - Window size: `max_queue_size` (configurable, default: 50)
-   - Jobs sorted by submission time (ascending)
+   - Jobs are ordered by arrival into the queue (event order)
    - When queue is shorter than window, pad with zero vectors
 
-2. **Cluster State** (Fully Observable)
-   - Normalized GPU availability metrics
-   - Real-time cluster utilization
+2. **Look-ahead Cluster Signal** (Fully Observable)
+   - Per-GPU remaining busy time (how long until each GPU becomes idle)
+   - This is the main “predictive” signal that helps the policy reason about
+     near-future capacity.
+
+3. **Cluster Ratios** (Fully Observable)
+   - `idle_gpus_ratio`
+   - `busy_gpus_ratio`
 
 ### 2.2 State Representation
 
@@ -49,16 +54,22 @@ state_dim = (max_queue_size * job_feature_dim) + cluster_feature_dim
 **Job Feature Vector** (per job in queue window):
 - `estimated_duration` (normalized: `duration / max_duration`)
 - `priority` (normalized: `priority / max_priority`)
-- `required_gpus` (normalized: `required_gpus / max_gpus_per_job`)
+- `required_gpus` (normalized: `required_gpus / num_gpus`)
 - `submission_time` (normalized: `(current_time - submission_time) / max_episode_time`)
 
-**Cluster Feature Vector**:
-- `idle_gpus_ratio` (scalar: `num_idle_gpus / total_gpus`)
-- `busy_gpus_ratio` (scalar: `num_busy_gpus / total_gpus`)
+**Look-ahead Feature Vector**:
+- `remaining_busy_time[gpu_i]` for each GPU \(i\)
+  - Idle GPU → 0.0
+  - Busy GPU → \((t_{end} - t_{now}) / max_duration\), clipped to \([0, 1]\)
+  - \(t_{end}\) is the job’s scheduled completion time in simulator time.
+
+**Cluster Ratio Features**:
+- `idle_gpus_ratio` = `num_idle_gpus / total_gpus`
+- `busy_gpus_ratio` = `num_busy_gpus / total_gpus`
 
 **Total State Dimension**:
 ```
-state_dim = (max_queue_size * 4) + 2
+state_dim = (max_queue_size * 4) + num_gpus + 2
 ```
 
 ### 2.3 Normalization
@@ -66,8 +77,9 @@ state_dim = (max_queue_size * 4) + 2
 All features are normalized to [0, 1] range for training stability:
 - Durations: Divided by maximum expected duration
 - Priorities: Divided by maximum priority level
-- GPU counts: Divided by maximum GPUs per job / total GPUs
-- Timestamps: Relative to episode start, normalized by max episode time
+- GPU counts: Divided by total GPUs
+- Waiting time: Relative to submission time, normalized by `max_episode_time`
+- Remaining busy time: Normalized by `max_duration`
 
 ### 2.4 Design Rationale
 
@@ -116,7 +128,8 @@ The reward function combines multiple objectives using dense (per-step) and even
 
 #### 4.1.1 Dense Reward (Per Step)
 ```python
-r_dense = -0.01 * queue_length
+# scaled by episode size so 400-job episodes don't become automatically worse
+r_dense = -queue_penalty_scale * (queue_length / total_jobs)
 ```
 - Penalizes jobs waiting in queue
 - Provides learning signal at every step
@@ -124,15 +137,17 @@ r_dense = -0.01 * queue_length
 
 #### 4.1.2 Job Completion Reward
 ```python
-r_completion = 1.0
+# "work-based" completion reward (scaled):
+work_norm = (estimated_duration / max_duration) * (required_gpus / num_gpus)
+r_completion = completion_work_scale * work_norm
 ```
 - Awarded immediately when a job completes
-- Provides throughput signal
-- Encourages agent to schedule jobs efficiently
+- Provides throughput / “useful work” signal
+- Encourages scheduling that completes meaningful work, not just many tiny jobs
 
 #### 4.1.3 Priority Bonus
 ```python
-r_priority = 0.1 * (job.priority / max_priority)
+r_priority = priority_bonus_scale * (job.priority / max_priority)
 ```
 - Awarded when a job completes
 - Higher priority jobs yield higher reward
@@ -140,11 +155,12 @@ r_priority = 0.1 * (job.priority / max_priority)
 
 #### 4.1.4 Episode Completion Bonus
 ```python
-r_episode = 10.0 * completion_rate
+r_episode = episode_bonus_scale * completion_rate
 ```
 - Awarded at episode end
 - `completion_rate = jobs_completed / total_jobs`
 - Provides overall throughput signal
+- Applied on **terminated OR truncated** episodes (partial credit on truncation)
 
 ### 4.2 Total Reward Formula
 
@@ -232,16 +248,25 @@ The environment evolves through discrete events:
 
 ### 6.1 Episode Termination
 
-An episode terminates when **both** conditions are met:
+An episode terminates when **all** conditions are met:
 1. Job queue is empty (no jobs waiting)
-2. All running jobs have completed (no jobs executing)
+2. All running jobs have completed (no busy GPUs)
+3. No future events remain (important when jobs arrive over time)
 
 ### 6.2 Episode Truncation
 
-Episodes are truncated (max steps reached) if:
-- Maximum steps exceeded: `max_steps = 2000` (configurable)
-- Prevents infinite episodes
-- Sets `truncated=True` in Gymnasium return
+Episodes are truncated if either limit hits (and the episode did not naturally terminate):
+- Step limit: `max_episode_steps`
+- Time limit: `max_episode_time`
+
+`max_episode_time` can be:
+- Fixed (if provided), or
+- Workload-aware per episode:
+  - Let \(LB = \sum_i (d_i \cdot g_i) / G\) be a lower bound on makespan
+  - Then:
+    \[
+      max\_episode\_time = last\_arrival + horizon\_factor \cdot LB
+    \]
 
 ### 6.3 Episode Length
 
@@ -375,14 +400,16 @@ Default configuration values:
 ```python
 max_queue_size = 50
 total_gpus = 8
-max_gpus_per_job = 8
 max_duration = 10000  # seconds
 max_priority = 10
 max_episode_steps = 2000
+jobs_per_episode = 400
+arrival_mode = "bursty"
+horizon_factor = 1.3
 ```
 
 ---
 
 **Document Status**: Final  
-**Last Updated**: 2024  
+**Last Updated**: 2026
 **Next Review**: After initial implementation and testing

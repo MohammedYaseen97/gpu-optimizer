@@ -41,11 +41,13 @@ class SJFScheduler:
         - Return its index+1 in the queue window.
         - If no schedulable job exists, return 0 (no-op).
         """
-        job_array = observation[:-2]
+        # Observation may include extra features; job window is always the first
+        # (max_queue_size * 4) entries. The last 2 entries remain cluster ratios.
+        job_feats = observation[: self.env.max_queue_size * 4]
         idle_ratio = observation[-2]  # scalar in [0,1]
 
-        assert len(job_array) % 4 == 0
-        len_jobs = len(job_array) // 4
+        assert len(job_feats) % 4 == 0
+        len_jobs = len(job_feats) // 4
 
         min_duration = float("inf")
         sjf_index = 0  # 0 = no-op
@@ -53,8 +55,8 @@ class SJFScheduler:
         for i in range(len_jobs):
             base = 4 * i
 
-            duration = job_array[base + 0]
-            required_gpus_ratio = job_array[base + 2]
+            duration = job_feats[base + 0]
+            required_gpus_ratio = job_feats[base + 2]
 
             # Skip padded / empty slots
             if duration <= 0.0:

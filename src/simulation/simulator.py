@@ -147,6 +147,7 @@ class Simulator:
         self.job_queue.remove(job)
         job.start_job(self.current_time)
         completion_time = self.current_time + job.estimated_duration
+        job.expected_end_time = completion_time
         job_completion_event = Event(event_type=EventType.JOB_COMPLETION, timestamp=completion_time, data={"job": job})
         self.schedule_event(job_completion_event)
         return True

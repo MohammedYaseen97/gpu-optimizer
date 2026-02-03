@@ -45,6 +45,9 @@ class Job:
         self.user_id = user_id
         self.status = JobStatus.SUBMITTED
         self.start_time = None
+        # Simulator-time timestamp when this job is expected to complete.
+        # Populated when the scheduler starts the job.
+        self.expected_end_time: Optional[float] = None
     
     def __repr__(self) -> str:
         """
