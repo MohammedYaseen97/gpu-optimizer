@@ -337,10 +337,6 @@ class PPOAgent(BaseAgent):
             if not file_exists:
                 csv_writer.writeheader()
 
-        # Seeded training reset (deterministic rolling)
-        next_obs_np, next_info = self._reset_train_env()
-        next_done = torch.tensor(0.0, dtype=torch.float32, device=device)
-
         lr_initial = float(cfg.learning_rate)
         ent_coef_now = float(cfg.ent_coef)
 
@@ -349,6 +345,11 @@ class PPOAgent(BaseAgent):
         best_eval_minblock = (float("-inf"), -1, -1)
 
         for update in range(1, total_updates + 1):
+            # Match the previous implementation: each rollout starts from a fresh,
+            # deterministically seeded training reset (no carry-over state between updates).
+            next_obs_np, next_info = self._reset_train_env()
+            next_done = torch.tensor(0.0, dtype=torch.float32, device=device)
+
             timesteps = int(update * num_steps)
             progress = float((update - 1) * num_steps) / float(max(1, cfg.total_timesteps))
             sched = str(cfg.lr_schedule).lower().strip()

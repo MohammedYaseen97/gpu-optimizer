@@ -141,9 +141,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--horizon-factor", type=float, default=1.3)
 
     # Evaluation config (experiment-level)
-    parser.add_argument("--num-eval-episodes", type=int, default=10)
+    # Default to the same eval sizing we used in the earlier multi-block runs.
+    parser.add_argument("--num-eval-episodes", type=int, default=60)
     parser.add_argument("--eval-interval-updates", type=int, default=10)
-    parser.add_argument("--eval-episodes", type=int, default=3)
+    parser.add_argument("--eval-episodes", type=int, default=20)
     parser.add_argument(
         "--eval-num-blocks",
         type=int,
