@@ -1,4 +1,11 @@
-"""PPO agent implementation for `SchedulerEnv`."""
+"""PPO agent implementation for `SchedulerEnv`.
+
+Kept intentionally small and readable:
+- collect rollout
+- compute GAE advantages / returns
+- PPO update (clipped objective)
+- optional CSV logging + periodic evaluation
+"""
 
 from dataclasses import dataclass
 from typing import Dict, Any, Tuple, Optional, List
@@ -33,6 +40,28 @@ class PPOConfig:
     vf_coef: float = 0.5
     max_grad_norm: float = 0.5
     normalize_advantages: bool = True
+    # LR scheduling:
+    # - constant: lr = learning_rate
+    # - linear:   lr = learning_rate * (1 - progress)
+    # - exp:      lr = learning_rate * (lr_exp_end_frac ** progress)
+    #   (so at the end, lr ~= learning_rate * lr_exp_end_frac)
+    lr_schedule: str = "linear"  # {"constant","linear","exp"}
+    lr_exp_end_frac: float = 0.2
+    # Clip per-minibatch change in entropy (new - old) to stabilize updates.
+    # Set <= 0 to disable.
+    entropy_jump_clip: float = 0.5
+    # Optional early stopping based on approximate KL divergence.
+    # If set (e.g. 0.02), stop PPO epochs early when KL grows too large.
+    target_kl: Optional[float] = None
+    # Periodic evaluation: number of fixed seed blocks to run.
+    # Each block uses a disjoint contiguous seed range of length `eval_episodes`.
+    eval_num_blocks: int = 3
+    # Seeding:
+    # - Training should see diverse episodes, but be reproducible.
+    # - Periodic eval should use a FIXED seed set so the curve is comparable.
+    seed: int = 1
+    train_seed_base: int = 1_000_000
+    eval_seed_base: int = 2_000_000
 
 
 class PPOAgent(BaseAgent):
@@ -44,12 +73,10 @@ class PPOAgent(BaseAgent):
 
         self.obs_dim = env.observation_space.shape[0]
         self.act_dim = env.action_space.n
-        self.mask_dim = env.max_queue_size + 1
 
         self.policy = PolicyNetwork(state_dim=self.obs_dim, action_dim=self.act_dim)
         self.value_fn = ValueNetwork(state_dim=self.obs_dim)
 
-        # Single optimizer over both networks for now (you can split later)
         self.optimizer = optim.Adam(
             list(self.policy.parameters()) + list(self.value_fn.parameters()),
             lr=config.learning_rate,
@@ -58,35 +85,72 @@ class PPOAgent(BaseAgent):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.policy.to(self.device)
         self.value_fn.to(self.device)
+        self._train_episode_idx = 0
+        self._eval_env: Optional[SchedulerEnv] = None
+        if hasattr(env, "_init_kwargs"):
+            try:
+                # Avoid perturbing training env state during periodic eval.
+                self._eval_env = SchedulerEnv(**getattr(env, "_init_kwargs"))
+            except Exception:
+                self._eval_env = None
 
-    def select_action(self, observation) -> int:
+    def _reset_train_env(self):
+        """Reset env for training with a deterministic, rolling seed schedule."""
+        seed = int(self.config.train_seed_base) + int(self.config.seed) + int(self._train_episode_idx)
+        self._train_episode_idx += 1
+        return self.env.reset(seed=seed)
+
+    @staticmethod
+    def _mask_logits(logits: torch.Tensor, action_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Apply a hard feasibility mask to logits.
+
+        `action_mask` is boolean with True meaning "allowed".
+        We set invalid logits to a very negative value (instead of -inf) to avoid
+        potential NaNs on some backends.
+        """
+        if action_mask.dtype != torch.bool:
+            action_mask = action_mask.bool()
+        if action_mask.ndim == 1:
+            action_mask = action_mask.unsqueeze(0)
+        return logits.masked_fill(~action_mask, -1e9)
+
+    def select_action(self, observation, action_mask: Optional[np.ndarray] = None) -> int:
         """Sample an action from the current policy for a single observation."""
-        obs_t = torch.as_tensor(observation, dtype=torch.float32, device=self.device)
-        obs_t = obs_t.unsqueeze(0)  # (1, obs_dim)
-
+        obs_t = torch.as_tensor(observation, dtype=torch.float32, device=self.device).unsqueeze(0)
         with torch.no_grad():
             logits = self.policy(obs_t)
+            if action_mask is not None:
+                mask_t = torch.as_tensor(action_mask, device=self.device).bool()
+                logits = self._mask_logits(logits, mask_t)
             dist = Categorical(logits=logits)
-            action = dist.sample()
+            return int(dist.sample().item())
 
-        return int(action.item())
-
-    def run_episode(self, max_steps: Optional[int] = None) -> float:
-        """Run one evaluation episode using the current policy and action mask."""
-        obs, info = self.env.reset()
+    def run_episode(
+        self,
+        max_steps: Optional[int] = None,
+        seed: Optional[int] = None,
+        deterministic: bool = True,
+    ) -> float:
+        """Run one evaluation episode using the current policy (with hard masking)."""
+        obs, info = self.env.reset(seed=seed)
         total_reward = 0.0
 
         limit = int(max_steps) if max_steps is not None else int(self.env.max_episode_steps)
         for _ in range(limit):
             obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
-            mask_t = torch.as_tensor(info["action_mask"], dtype=torch.bool, device=self.device)
+            mask = info.get("action_mask", None)
+            mask_t = None if mask is None else torch.as_tensor(mask, device=self.device).bool()
 
             with torch.no_grad():
-                logits = self.policy(obs_t)
-                masked_logits = logits.clone()
-                masked_logits[:, ~mask_t] = -float("inf")
-                dist = Categorical(logits=masked_logits)
-                action = int(dist.sample().item())
+                logits = self.policy(obs_t)  # (1, act_dim)
+                if mask_t is not None:
+                    logits = self._mask_logits(logits, mask_t)
+                if deterministic:
+                    action = int(torch.argmax(logits, dim=-1).item())
+                else:
+                    dist = Categorical(logits=logits)
+                    action = int(dist.sample().item())
 
             obs, reward, terminated, truncated, info = self.env.step(action)
             total_reward += reward
@@ -95,228 +159,110 @@ class PPOAgent(BaseAgent):
 
         return total_reward
 
-    # ---- Rollout collection -------------------------------------------------
+    def run_episode_with_stats(
+        self,
+        max_steps: Optional[int] = None,
+        seed: Optional[int] = None,
+        deterministic: bool = True,
+    ) -> Dict[str, float]:
+        """Run one episode and return reward + invalid/no-op rates."""
+        obs, info = self.env.reset(seed=seed)
+        total_reward = 0.0
+        invalid_steps = 0
+        noop_steps = 0
+        steps = 0
 
-    def _collect_rollout(self) -> Dict[str, torch.Tensor]:
-        """Collect one on-policy rollout of length `config.num_steps`.
+        limit = int(max_steps) if max_steps is not None else int(self.env.max_episode_steps)
+        for _ in range(limit):
+            obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+            mask = info.get("action_mask", None)
+            mask_t = None if mask is None else torch.as_tensor(mask, device=self.device).bool()
+            with torch.no_grad():
+                logits = self.policy(obs_t)
+                if mask_t is not None:
+                    logits = self._mask_logits(logits, mask_t)
+                if deterministic:
+                    action = int(torch.argmax(logits, dim=-1).item())
+                else:
+                    dist = Categorical(logits=logits)
+                    action = int(dist.sample().item())
 
-        Also tracks any completed episodes encountered during collection so
-        training can log episodic returns (more meaningful than raw loss curves).
-        """
+            obs, reward, terminated, truncated, info = self.env.step(action)
+            total_reward += float(reward)
+            steps += 1
+            if action == 0:
+                noop_steps += 1
+            if bool(info.get("invalid_action", False)):
+                invalid_steps += 1
 
-        # ---------------- utility function to get action, logprob, value --
+            if terminated or truncated:
+                break
 
-        def get_action_and_value(
-            obs: torch.Tensor, action_mask: torch.Tensor
-        ) -> Tuple[int, torch.Tensor, torch.Tensor, torch.Tensor]:
-            """
-            obs         : (obs_dim,) tensor on device
-            action_mask : (act_dim,) bool tensor on device
-            """
-            obs = obs.unsqueeze(0)  # (1, obs_dim)
-
-            with torch.no_grad():  # no grads during data collection
-                logits = self.policy(obs)          # (1, act_dim)
-                value = self.value_fn(obs).squeeze(0)  # (1,1)->(1,) or (1,) -> treat as (1,)
-
-                masked_logits = logits.clone()
-                masked_logits[:, ~action_mask] = -float("inf")
-
-                dist = Categorical(logits=masked_logits)
-                action = dist.sample()             # (1,)
-
-            return int(action.item()), dist.log_prob(action.squeeze(0)), dist.entropy().squeeze(0), value.squeeze(0)
-
-        # -------- running the policy rollout loop -------------------------
-
-        config = self.config
-
-        # only need to store tensors on the device
-        obs = torch.zeros((config.num_steps, self.obs_dim), device=self.device)        # (T, obs_dim)
-        actions = torch.zeros(config.num_steps, dtype=torch.long, device=self.device)  # (T,)
-        logprobs = torch.zeros(config.num_steps, device=self.device)                   # (T,)
-        rewards = torch.zeros(config.num_steps, device=self.device)                    # (T,)
-        dones = torch.zeros(config.num_steps, device=self.device)                      # (T,)
-        values = torch.zeros(config.num_steps, device=self.device)                     # (T,)
-        action_masks = torch.ones(
-            (config.num_steps, self.mask_dim), dtype=torch.bool, device=self.device
-        )  # (T, act_dim)
-
-        next_obs, next_info = self.env.reset()
-        next_done = torch.tensor(0.0, dtype=torch.float32, device=self.device)
-
-        ep_returns: List[float] = []
-        ep_lengths: List[int] = []
-        running_return = 0.0
-        running_len = 0
-
-        for step in range(config.num_steps):
-            next_obs_t = torch.as_tensor(next_obs, dtype=torch.float32, device=self.device)
-            obs[step] = next_obs_t
-
-            action_mask_t = torch.as_tensor(
-                next_info["action_mask"], dtype=torch.bool, device=self.device
-            )
-            action_masks[step] = action_mask_t
-
-            action, logprob, _, value = get_action_and_value(next_obs_t, action_mask_t)
-
-            actions[step] = action
-            logprobs[step] = logprob
-            values[step] = value
-            dones[step] = next_done
-
-            next_obs, reward, terminated, truncated, next_info = self.env.step(action)
-            rewards[step] = torch.tensor(reward, dtype=torch.float32, device=self.device)
-            next_done = torch.tensor(
-                float(np.logical_or(terminated, truncated)), dtype=torch.float32, device=self.device
-            )
-
-            running_return += float(reward)
-            running_len += 1
-
-            if next_done.item():
-                ep_returns.append(running_return)
-                ep_lengths.append(running_len)
-                running_return = 0.0
-                running_len = 0
-                next_obs, next_info = self.env.reset()
-
-        # Bootstrap value for last state
-        next_obs_t = torch.as_tensor(next_obs, dtype=torch.float32, device=self.device)
-        action_mask_t = torch.as_tensor(next_info["action_mask"], dtype=torch.bool, device=self.device)
-        _, _, _, next_value = get_action_and_value(next_obs_t, action_mask_t)
-
+        denom = float(max(1, steps))
         return {
-            "obs": obs,
-            "action_masks": action_masks,
-            "actions": actions,
-            "logprobs": logprobs,
-            "rewards": rewards,
-            "dones": dones,
-            "values": values,
-            "last_value": next_value,
-            "last_done": next_done,
-            "ep_returns": ep_returns,
-            "ep_lengths": ep_lengths,
+            "total_reward": float(total_reward),
+            "steps": float(steps),
+            "invalid_frac": float(invalid_steps / denom),
+            "noop_frac": float(noop_steps / denom),
         }
-        
-    # ---- Advantage and return computation -----------------------------------
-    
-    def _compute_returns_and_advantages(self, batch: Dict[str, torch.Tensor]) -> Dict[str, torch.Tensor]:
-        """Compute GAE advantages and returns for a rollout batch."""
-        
-        rewards, dones, values = (batch[k] for k in ("rewards", "dones", "values"))
-        last_value, last_done = batch["last_value"], batch["last_done"]
-        
-        advantages = torch.zeros_like(rewards).to(self.device)
-        lastgaelam = 0
-        for t in reversed(range(self.config.num_steps)):
-            if t == self.config.num_steps - 1:
-                nextnonterminal = 1 - last_done
-                nextvalues = last_value
-            else:
-                nextnonterminal = 1 - dones[t+1]
-                nextvalues = values[t+1]
-            delta_t = rewards[t] + self.config.gamma * nextvalues * nextnonterminal - values[t]
-            advantages[t] = lastgaelam = delta_t + self.config.gamma * self.config.gae_lambda * nextnonterminal * lastgaelam
-        returns = advantages + values
-            
+
+    def _run_episode_with_stats_on_env(
+        self,
+        env: SchedulerEnv,
+        *,
+        max_steps: Optional[int] = None,
+        seed: Optional[int] = None,
+        deterministic: bool = True,
+    ) -> Dict[str, float]:
+        """Same as `run_episode_with_stats`, but on a specific env instance."""
+        obs, info = env.reset(seed=seed)
+        total_reward = 0.0
+        invalid_steps = 0
+        noop_steps = 0
+        steps = 0
+
+        limit = int(max_steps) if max_steps is not None else int(env.max_episode_steps)
+        for _ in range(limit):
+            obs_t = torch.as_tensor(obs, dtype=torch.float32, device=self.device).unsqueeze(0)
+            mask = info.get("action_mask", None)
+            mask_t = None if mask is None else torch.as_tensor(mask, device=self.device).bool()
+            with torch.no_grad():
+                logits = self.policy(obs_t)
+                if mask_t is not None:
+                    logits = self._mask_logits(logits, mask_t)
+                if deterministic:
+                    action = int(torch.argmax(logits, dim=-1).item())
+                else:
+                    dist = Categorical(logits=logits)
+                    action = int(dist.sample().item())
+
+            obs, reward, terminated, truncated, info = env.step(action)
+            total_reward += float(reward)
+            steps += 1
+            if action == 0:
+                noop_steps += 1
+            if bool(info.get("invalid_action", False)):
+                invalid_steps += 1
+
+            if terminated or truncated:
+                break
+
+        denom = float(max(1, steps))
         return {
-            "advantages": advantages,
-            "returns": returns
-        }            
-
-    # ---- PPO update step ----------------------------------------------------
-
-    def _update(self, batch: Dict[str, torch.Tensor]) -> Dict[str, float]:
-        """Perform PPO updates on a collected batch and return scalar losses."""
-        
-        obs, action_masks, actions, old_logprobs, advantages, returns = (
-            batch[k]
-            for k in ("obs", "action_masks", "actions", "logprobs", "advantages", "returns")
-        )
-
-        batch_size = self.config.num_steps
-        minibatch_size = batch_size // self.config.num_minibatches
-
-        b_inds = np.arange(batch_size)
-        for epoch in range(self.config.update_epochs):
-            np.random.shuffle(b_inds)
-            for start in range(0, batch_size, minibatch_size):
-                end = start + minibatch_size
-                mb_inds = b_inds[start:end]
-
-                # Mini-batch tensors
-                mb_obs = obs[mb_inds]  # (B, obs_dim)
-                mb_masks = action_masks[mb_inds]  # (B, act_dim)
-                mb_actions = actions[mb_inds].long()  # (B,)
-                mb_old_logprobs = old_logprobs[mb_inds]
-
-                # Compute new logprobs, entropy, values for minibatch
-                logits = self.policy(mb_obs)
-                values_mb = self.value_fn(mb_obs).squeeze(-1)  # (B,)
-
-                masked_logits = logits.clone()
-                masked_logits[~mb_masks] = -float("inf")
-                dist = Categorical(logits=masked_logits)
-
-                new_logprobs = dist.log_prob(mb_actions)
-                new_entropy = dist.entropy()
-
-                logratio = new_logprobs - mb_old_logprobs
-                ratio = torch.exp(logratio)
-                
-                mb_advantages = advantages[mb_inds]
-                if self.config.normalize_advantages:
-                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (
-                        mb_advantages.std() + 1e-8
-                    )
-                
-                # Policy loss
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(
-                    ratio, 1 - self.config.clip_coef, 1 + self.config.clip_coef
-                )
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-                # Value loss
-                v_loss_unclipped = (values_mb - returns[mb_inds]) ** 2
-                v_clipped = torch.clamp(
-                    values_mb - returns[mb_inds],
-                    -self.config.clip_coef,
-                    self.config.clip_coef,
-                )
-                v_loss_clipped = (v_clipped - returns[mb_inds]) ** 2
-                v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                v_loss = 0.5 * v_loss_max.mean()
-                
-                # Entropy loss
-                entropy_loss = new_entropy.mean()
-                loss = pg_loss - self.config.ent_coef * entropy_loss + v_loss * self.config.vf_coef
-
-                self.optimizer.zero_grad()
-                loss.backward()
-                nn.utils.clip_grad_norm_(
-                    list(self.policy.parameters()) + list(self.value_fn.parameters()),
-                    self.config.max_grad_norm,
-                )
-                self.optimizer.step()
-                
-        return {
-            "pg_loss": pg_loss.item(),
-            "v_loss": v_loss.item(),
-            "entropy_loss": entropy_loss.item(),
-            "loss": loss.item()
+            "total_reward": float(total_reward),
+            "steps": float(steps),
+            "invalid_frac": float(invalid_steps / denom),
+            "noop_frac": float(noop_steps / denom),
         }
-        
-    # ---- High-level training loop ------------------------------------------
+
+    # ---- High-level training loop (ppo.py-style) ----------------------------
 
     def train(
         self,
         log_csv_path: Optional[str] = None,
         eval_interval_updates: int = 0,
         eval_episodes: int = 0,
+        eval_deterministic: bool = True,
     ) -> None:
         """Main training loop: rollouts → advantages → PPO updates with logging.
 
@@ -327,11 +273,32 @@ class PPOAgent(BaseAgent):
         `eval_mean_return` (this is usually the most interpretable learning curve
         for long episodes where rollouts may not contain full episode terminations).
         """
-        total_timesteps = 0
-        update_idx = 0
+        cfg = self.config
+        device = self.device
 
+        num_steps = int(cfg.num_steps)
+        total_updates = int(np.ceil(float(cfg.total_timesteps) / float(num_steps)))
+        minibatch_size = int(num_steps // int(cfg.num_minibatches))
+        if minibatch_size <= 0:
+            raise ValueError("num_minibatches is too large for num_steps")
+
+        # Rollout storage (re-used each update; ppo.py style)
+        obs = torch.zeros((num_steps, self.obs_dim), dtype=torch.float32, device=device)
+        actions = torch.zeros((num_steps,), dtype=torch.long, device=device)
+        old_logprobs = torch.zeros((num_steps,), dtype=torch.float32, device=device)
+        old_entropies = torch.zeros((num_steps,), dtype=torch.float32, device=device)
+        rewards = torch.zeros((num_steps,), dtype=torch.float32, device=device)
+        dones = torch.zeros((num_steps,), dtype=torch.float32, device=device)
+        values = torch.zeros((num_steps,), dtype=torch.float32, device=device)
+        action_masks = torch.zeros((num_steps, self.act_dim), dtype=torch.bool, device=device)
+        invalids = torch.zeros((num_steps,), dtype=torch.float32, device=device)
+        noops = torch.zeros((num_steps,), dtype=torch.float32, device=device)
+
+        # Logging setup
         csv_file = None
         csv_writer = None
+        eval_num_blocks = int(max(1, cfg.eval_num_blocks))
+        eval_block_fields = [f"eval_block{b}_return" for b in range(eval_num_blocks)]
         if log_csv_path is not None:
             os.makedirs(os.path.dirname(log_csv_path) or ".", exist_ok=True)
             file_exists = os.path.exists(log_csv_path)
@@ -345,6 +312,22 @@ class PPOAgent(BaseAgent):
                     "mean_ep_length",
                     "num_episodes",
                     "eval_mean_return",
+                    "eval_min_block_return",
+                    "eval_max_block_return",
+                    *eval_block_fields,
+                    "invalid_frac",
+                    "noop_frac",
+                    "eval_invalid_frac",
+                    "eval_noop_frac",
+                    "lr",
+                    "ent_coef",
+                    # Backwards-compatible single KL column (matches older CSVs)
+                    # while also logging richer diagnostics.
+                    "approx_kl",
+                    "approx_kl_last",
+                    "approx_kl_mean",
+                    "approx_kl_max",
+                    "early_stop",
                     "loss",
                     "pg_loss",
                     "v_loss",
@@ -354,50 +337,281 @@ class PPOAgent(BaseAgent):
             if not file_exists:
                 csv_writer.writeheader()
 
-        while total_timesteps < self.config.total_timesteps:
-            rollout_batch = self._collect_rollout()
-            ret_adv = self._compute_returns_and_advantages(rollout_batch)
-            batch = {**rollout_batch, **ret_adv}
-            stats = self._update(batch)
+        # Seeded training reset (deterministic rolling)
+        next_obs_np, next_info = self._reset_train_env()
+        next_done = torch.tensor(0.0, dtype=torch.float32, device=device)
 
-            total_timesteps += self.config.num_steps
-            update_idx += 1
+        lr_initial = float(cfg.learning_rate)
+        ent_coef_now = float(cfg.ent_coef)
 
-            ep_returns = rollout_batch.get("ep_returns", [])
-            ep_lengths = rollout_batch.get("ep_lengths", [])
-            mean_ep_return = float(np.mean(ep_returns)) if len(ep_returns) > 0 else float("nan")
-            mean_ep_length = float(np.mean(ep_lengths)) if len(ep_lengths) > 0 else float("nan")
+        # Track best evaluation points (for your “best not in first half” question)
+        best_eval_mean = (float("-inf"), -1, -1)  # (value, update, timesteps)
+        best_eval_minblock = (float("-inf"), -1, -1)
 
-            # Simple logging so you can see training behaviour
+        for update in range(1, total_updates + 1):
+            timesteps = int(update * num_steps)
+            progress = float((update - 1) * num_steps) / float(max(1, cfg.total_timesteps))
+            sched = str(cfg.lr_schedule).lower().strip()
+            if sched == "constant":
+                lr_now = lr_initial
+            elif sched == "linear":
+                lr_now = lr_initial * float(np.clip(1.0 - progress, 0.0, 1.0))
+            elif sched == "exp":
+                end_frac = float(np.clip(float(cfg.lr_exp_end_frac), 1e-6, 1.0))
+                lr_now = lr_initial * (end_frac ** progress)
+            else:
+                raise ValueError(f"Unknown lr_schedule={cfg.lr_schedule!r}. Use constant|linear|exp.")
+            for pg in self.optimizer.param_groups:
+                pg["lr"] = lr_now
+
+            # ---- Rollout collection ---------------------------------------
+            ep_returns: List[float] = []
+            ep_lengths: List[int] = []
+            running_return = 0.0
+            running_len = 0
+
+            for step in range(num_steps):
+                obs_t = torch.as_tensor(next_obs_np, dtype=torch.float32, device=device)
+                obs[step] = obs_t
+                dones[step] = next_done
+
+                mask_np = next_info.get("action_mask", None)
+                if mask_np is None:
+                    mask_t = torch.ones((self.act_dim,), dtype=torch.bool, device=device)
+                else:
+                    mask_t = torch.as_tensor(mask_np, device=device).bool()
+                action_masks[step] = mask_t
+
+                with torch.no_grad():
+                    logits = self.policy(obs_t.unsqueeze(0))  # (1, act_dim)
+                    logits = self._mask_logits(logits, mask_t)
+                    dist = Categorical(logits=logits)
+                    action_t = dist.sample()  # (1,)
+                    old_logprob_t = dist.log_prob(action_t)  # (1,)
+                    old_entropy_t = dist.entropy()  # (1,)
+                    value_t = self.value_fn(obs_t.unsqueeze(0)).squeeze(-1)  # (1,)
+
+                action = int(action_t.item())
+                actions[step] = action
+                old_logprobs[step] = old_logprob_t.squeeze(0)
+                old_entropies[step] = old_entropy_t.squeeze(0)
+                values[step] = value_t.squeeze(0)
+
+                next_obs_np, reward, terminated, truncated, next_info = self.env.step(action)
+                done_flag = bool(np.logical_or(terminated, truncated))
+                next_done = torch.tensor(1.0 if done_flag else 0.0, dtype=torch.float32, device=device)
+
+                rewards[step] = float(reward)
+                invalids[step] = float(bool(next_info.get("invalid_action", False)))
+                noops[step] = float(action == 0)
+
+                running_return += float(reward)
+                running_len += 1
+                if done_flag:
+                    ep_returns.append(running_return)
+                    ep_lengths.append(running_len)
+                    running_return = 0.0
+                    running_len = 0
+                    next_obs_np, next_info = self._reset_train_env()
+                    next_done = torch.tensor(0.0, dtype=torch.float32, device=device)
+
+            # Bootstrap value for last state (GAE)
+            with torch.no_grad():
+                next_obs_t = torch.as_tensor(next_obs_np, dtype=torch.float32, device=device)
+                next_value = self.value_fn(next_obs_t.unsqueeze(0)).squeeze(0).squeeze(-1)
+
+            # ---- GAE advantages + returns ----------------------------------
+            advantages = torch.zeros_like(rewards, device=device)
+            lastgaelam = torch.tensor(0.0, dtype=torch.float32, device=device)
+            for t in reversed(range(num_steps)):
+                if t == num_steps - 1:
+                    nextnonterminal = 1.0 - next_done
+                    nextvalues = next_value
+                else:
+                    nextnonterminal = 1.0 - dones[t + 1]
+                    nextvalues = values[t + 1]
+                delta = rewards[t] + cfg.gamma * nextvalues * nextnonterminal - values[t]
+                lastgaelam = delta + cfg.gamma * cfg.gae_lambda * nextnonterminal * lastgaelam
+                advantages[t] = lastgaelam
+            returns = advantages + values
+            if cfg.normalize_advantages:
+                advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+
+            # ---- PPO update (minibatch SGD) --------------------------------
+            b_inds = np.arange(num_steps)
+            approx_kls: List[float] = []
+            approx_kl_last = float("nan")
+            approx_kl_max = float("-inf")
+            early_stop = False
+
+            for epoch in range(int(cfg.update_epochs)):
+                np.random.shuffle(b_inds)
+                for start in range(0, num_steps, minibatch_size):
+                    end = start + minibatch_size
+                    mb_inds = b_inds[start:end]
+
+                    mb_obs = obs[mb_inds]
+                    mb_actions = actions[mb_inds]
+                    mb_old_logprobs = old_logprobs[mb_inds]
+                    mb_old_entropies = old_entropies[mb_inds]
+                    mb_adv = advantages[mb_inds]
+                    mb_returns = returns[mb_inds]
+                    mb_old_values = values[mb_inds]
+                    mb_masks = action_masks[mb_inds]
+
+                    logits = self.policy(mb_obs)
+                    logits = self._mask_logits(logits, mb_masks)
+                    dist = Categorical(logits=logits)
+
+                    new_logprobs = dist.log_prob(mb_actions)
+                    new_entropy = dist.entropy()
+                    new_values = self.value_fn(mb_obs).squeeze(-1)
+
+                    logratio = new_logprobs - mb_old_logprobs
+                    ratio = torch.exp(logratio)
+
+                    with torch.no_grad():
+                        approx_kl_t = ((ratio - 1.0) - logratio).mean()
+                        approx_kl_last = float(approx_kl_t.item())
+                        approx_kls.append(approx_kl_last)
+                        approx_kl_max = max(approx_kl_max, approx_kl_last)
+
+                    # Policy loss (clipped ratio)
+                    pg_loss1 = -mb_adv * ratio
+                    pg_loss2 = -mb_adv * torch.clamp(ratio, 1 - cfg.clip_coef, 1 + cfg.clip_coef)
+                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                    # Value loss (clipped)
+                    v_loss_unclipped = (new_values - mb_returns) ** 2
+                    v_pred_clipped = mb_old_values + torch.clamp(
+                        new_values - mb_old_values, -cfg.clip_coef, cfg.clip_coef
+                    )
+                    v_loss_clipped = (v_pred_clipped - mb_returns) ** 2
+                    v_loss = 0.5 * torch.max(v_loss_unclipped, v_loss_clipped).mean()
+
+                    # Entropy bonus (with optional “jump” clamp)
+                    if float(cfg.entropy_jump_clip) > 0.0:
+                        clip = float(cfg.entropy_jump_clip)
+                        new_entropy = mb_old_entropies + torch.clamp(new_entropy - mb_old_entropies, -clip, clip)
+                    entropy_loss = new_entropy.mean()
+
+                    loss = pg_loss - ent_coef_now * entropy_loss + cfg.vf_coef * v_loss
+
+                    self.optimizer.zero_grad()
+                    loss.backward()
+                    nn.utils.clip_grad_norm_(
+                        list(self.policy.parameters()) + list(self.value_fn.parameters()),
+                        cfg.max_grad_norm,
+                    )
+                    self.optimizer.step()
+
+                    # Target-KL early stop (use max KL across minibatches)
+                    if cfg.target_kl is not None and approx_kl_last > float(cfg.target_kl):
+                        early_stop = True
+                        break
+                if early_stop:
+                    break
+
+            approx_kl_mean = float(np.mean(approx_kls)) if len(approx_kls) else float("nan")
+            if approx_kl_max == float("-inf"):
+                approx_kl_max = float("nan")
+
+            mean_ep_return = float(np.mean(ep_returns)) if len(ep_returns) else float("nan")
+            mean_ep_length = float(np.mean(ep_lengths)) if len(ep_lengths) else float("nan")
+            invalid_frac = float(invalids.mean().item())
+            noop_frac = float(noops.mean().item())
+
             print(
-                f"[PPO] update={update_idx}  timesteps={total_timesteps}  "
-                f"loss={stats['loss']:.3f}  pg={stats['pg_loss']:.3f}  "
-                f"v={stats['v_loss']:.3f}  ent={stats['entropy_loss']:.3f}"
+                f"[PPO] update={update}  timesteps={timesteps}  "
+                f"loss={loss.item():.3f}  pg={pg_loss.item():.3f}  "
+                f"v={v_loss.item():.3f}  ent={entropy_loss.item():.3f}  "
+                f"kl_last={approx_kl_last:.4f}  kl_mean={approx_kl_mean:.4f}  kl_max={approx_kl_max:.4f}  "
+                f"stop={int(early_stop)}  inv={invalid_frac:.3f}  noop={noop_frac:.3f}",
+                flush=True,
             )
 
-            if csv_writer is not None:
-                eval_mean_return = float("nan")
-                if eval_interval_updates and eval_episodes and (update_idx % eval_interval_updates == 0):
-                    eval_rewards = [self.run_episode() for _ in range(int(eval_episodes))]
-                    eval_mean_return = float(np.mean(eval_rewards))
+            # ---- Periodic evaluation --------------------------------------
+            eval_mean_return = float("nan")
+            eval_min_block_return = float("nan")
+            eval_max_block_return = float("nan")
+            eval_invalid_frac = float("nan")
+            eval_noop_frac = float("nan")
+            eval_block_returns: list[float] = []
 
-                csv_writer.writerow(
-                    {
-                        "update": update_idx,
-                        "timesteps": total_timesteps,
-                        "mean_ep_return": mean_ep_return,
-                        "mean_ep_length": mean_ep_length,
-                        "num_episodes": len(ep_returns),
-                        "eval_mean_return": eval_mean_return,
-                        "loss": stats["loss"],
-                        "pg_loss": stats["pg_loss"],
-                        "v_loss": stats["v_loss"],
-                        "entropy": stats["entropy_loss"],
-                    }
-                )
+            if csv_writer is not None and eval_interval_updates and eval_episodes and (update % int(eval_interval_updates) == 0):
+                base = int(cfg.eval_seed_base) + int(cfg.seed)
+                num_blocks = int(max(1, cfg.eval_num_blocks))
+                block_size = int(eval_episodes)
+                eval_env = self._eval_env if self._eval_env is not None else self.env
+                all_stats = []
+                for b in range(num_blocks):
+                    block_base = base + b * block_size
+                    block_stats = [
+                        self._run_episode_with_stats_on_env(
+                            eval_env,
+                            seed=block_base + ep,
+                            deterministic=bool(eval_deterministic),
+                        )
+                        for ep in range(block_size)
+                    ]
+                    all_stats.extend(block_stats)
+                    eval_block_returns.append(float(np.mean([s["total_reward"] for s in block_stats])))
+
+                eval_mean_return = float(np.mean(eval_block_returns))
+                eval_min_block_return = float(np.min(eval_block_returns))
+                eval_max_block_return = float(np.max(eval_block_returns))
+                eval_invalid_frac = float(np.mean([s["invalid_frac"] for s in all_stats]))
+                eval_noop_frac = float(np.mean([s["noop_frac"] for s in all_stats]))
+
+                # Track best eval points.
+                if eval_mean_return > best_eval_mean[0]:
+                    best_eval_mean = (eval_mean_return, update, timesteps)
+                if eval_min_block_return > best_eval_minblock[0]:
+                    best_eval_minblock = (eval_min_block_return, update, timesteps)
+
+            if csv_writer is not None:
+                row = {
+                    "update": update,
+                    "timesteps": timesteps,
+                    "mean_ep_return": mean_ep_return,
+                    "mean_ep_length": mean_ep_length,
+                    "num_episodes": len(ep_returns),
+                    "eval_mean_return": eval_mean_return,
+                    "eval_min_block_return": eval_min_block_return,
+                    "eval_max_block_return": eval_max_block_return,
+                    "invalid_frac": invalid_frac,
+                    "noop_frac": noop_frac,
+                    "eval_invalid_frac": eval_invalid_frac,
+                    "eval_noop_frac": eval_noop_frac,
+                    "lr": lr_now,
+                    "ent_coef": ent_coef_now,
+                    "approx_kl": approx_kl_last,
+                    "approx_kl_last": approx_kl_last,
+                    "approx_kl_mean": approx_kl_mean,
+                    "approx_kl_max": approx_kl_max,
+                    "early_stop": float(1.0 if early_stop else 0.0),
+                    "loss": float(loss.item()),
+                    "pg_loss": float(pg_loss.item()),
+                    "v_loss": float(v_loss.item()),
+                    "entropy": float(entropy_loss.item()),
+                }
+                for b, v in enumerate(eval_block_returns):
+                    row[f"eval_block{b}_return"] = float(v)
+                csv_writer.writerow(row)
                 csv_file.flush()
 
         if csv_file is not None:
             csv_file.close()
+
+        if best_eval_mean[1] != -1:
+            print(
+                f"[PPO] Best eval_mean_return={best_eval_mean[0]:.3f} at update={best_eval_mean[1]} timesteps={best_eval_mean[2]}",
+                flush=True,
+            )
+        if best_eval_minblock[1] != -1:
+            print(
+                f"[PPO] Best eval_min_block_return={best_eval_minblock[0]:.3f} at update={best_eval_minblock[1]} timesteps={best_eval_minblock[2]}",
+                flush=True,
+            )
 
 

@@ -66,19 +66,25 @@ class SchedulerEnv(gym.Env):
         horizon_factor: float = 1.3,
         max_priority: int = 10,
         # --- reward coefficients ---
-        # Dense queue penalty keeps pressure on clearing the queue.
-        queue_penalty_scale: float = 0.2,
-        # Completion reward scaling for "work reward" (duration * required_gpus).
-        # NOTE: under heavy-tail workloads, the raw normalized work term can be small
-        # (often ~0.01-0.05). A larger scale keeps completion rewards comparable to
-        # the dense penalty over long episodes.
-        completion_work_scale: float = 30.0,
-        # Priority bonus scaling on completion (adds a small preference, doesn't dominate).
-        priority_bonus_scale: float = 0.1,
-        # Episode bonus scaling at end-of-episode (terminated OR truncated).
-        episode_bonus_scale: float = 10.0,
+        # Reward is throughput-oriented (work-by-deadline) and intentionally simple.
+        #
+        # Terms (all normalized by total episode work, so magnitudes are stable):
+        # - + progress:     delta_completed_work / total_work
+        # - - time_pressure:(dt / max_episode_time) * (available_work / total_work)
+        # - - noop_penalty: when agent no-ops despite feasible work
+        # - terminal:
+        #     - terminated early: + (time_left / max_episode_time)
+        #     - truncated (deadline hit): - (unfinished_work / total_work)
+        #
+        # Scales below let you tune relative importance (defaults are conservative).
+        progress_scale: float = 1.0,
+        time_pressure_scale: float = 1.0,
+        noop_penalty_scale: float = 0.05,
+        early_finish_bonus_scale: float = 1.0,
+        deadline_miss_penalty_scale: float = 1.0,
         debug: bool = False,
-        **kwargs: Any,
+        # (unused) Accept extra kwargs so scripts can pass through safely.
+        **_: Any,
     ):
         """
         Wire up the environment according to the MDP spec.
@@ -87,26 +93,28 @@ class SchedulerEnv(gym.Env):
 
         # The simulator max_time is set on each reset (workload-aware horizon).
         self.simulator = Simulator(Cluster(num_gpus), max_time=1.0)
-        
-        self.num_gpus = num_gpus
-        self.max_queue_size = max_queue_size
-        self.max_episode_steps = max_episode_steps
-        self.max_duration = max_duration
-        self._fixed_max_episode_time = max_episode_time
-        self.horizon_factor = horizon_factor
-        self.max_episode_time = 1.0  # populated at reset
-        self.max_priority = max_priority
 
-        self.jobs_per_episode = jobs_per_episode
+        # Core sizes / limits
+        self.num_gpus = int(num_gpus)
+        self.max_queue_size = int(max_queue_size)
+        self.max_episode_steps = int(max_episode_steps)
+        self.max_duration = float(max_duration)
+        self._fixed_max_episode_time = max_episode_time
+        self.horizon_factor = float(horizon_factor)
+        self.max_episode_time = 1.0  # populated at reset
+        self.max_priority = int(max_priority)
+
+        # Workload generation configuration
+        self.jobs_per_episode = int(jobs_per_episode)
         self.arrival_mode = arrival_mode
         self.arrival_span = arrival_span if arrival_span is not None else max_duration
-        self.num_bursts = num_bursts
-        self.burst_prob = burst_prob
-        self.burst_std_frac = burst_std_frac
-        self.debug = debug
+        self.num_bursts = int(num_bursts)
+        self.burst_prob = float(burst_prob)
+        self.burst_std_frac = float(burst_std_frac)
+        self.debug = bool(debug)
 
         self.duration_mode = duration_mode
-        self.heavy_tail_frac = heavy_tail_frac
+        self.heavy_tail_frac = float(heavy_tail_frac)
         self.max_gpus_per_job = (
             int(max_gpus_per_job)
             if max_gpus_per_job is not None
@@ -115,10 +123,12 @@ class SchedulerEnv(gym.Env):
         self.gpus_duration_corr = float(np.clip(gpus_duration_corr, 0.0, 1.0))
         self.priority_duration_corr = priority_duration_corr
         self.priority_corr_strength = float(np.clip(priority_corr_strength, 0.0, 1.0))
-        self.queue_penalty_scale = float(queue_penalty_scale)
-        self.completion_work_scale = float(completion_work_scale)
-        self.priority_bonus_scale = float(priority_bonus_scale)
-        self.episode_bonus_scale = float(episode_bonus_scale)
+        # Reward scales (throughput-oriented)
+        self.progress_scale = float(progress_scale)
+        self.time_pressure_scale = float(time_pressure_scale)
+        self.noop_penalty_scale = float(noop_penalty_scale)
+        self.early_finish_bonus_scale = float(early_finish_bonus_scale)
+        self.deadline_miss_penalty_scale = float(deadline_miss_penalty_scale)
         
         # Observation layout:
         # - job window: max_queue_size * 4
@@ -135,8 +145,8 @@ class SchedulerEnv(gym.Env):
         
         self.step_count = 0
         self.total_jobs_generated = 0
-
-        return
+        self.total_work_generated = 1.0
+        self._prev_time = 0.0
 
 
     def reset(
@@ -154,7 +164,6 @@ class SchedulerEnv(gym.Env):
         - Return a valid observation in `observation_space` and an `info` dict
           (commonly containing an action mask)
         """
-        # Optional seeding hook for reproducibility.
         if seed is not None:
             np.random.seed(seed)
 
@@ -162,31 +171,17 @@ class SchedulerEnv(gym.Env):
 
         self.step_count = 0
 
-        # --------- workload generation (jobs + arrivals) ---------------------
+        # Workload generation
         n = int(self.jobs_per_episode)
         self.total_jobs_generated = n
-
-        # 1) Sample per-job attributes (durations/priority/GPU demand).
         durations, priorities, required_gpus = self._sample_job_attributes(n)
-
-        # 2) Sample arrival times (either all-at-once or bursty over a span).
         submission_times = self._sample_submission_times(n)
-
-        # 3) Compute a per-episode time horizon and set the simulator limit.
-        self._set_episode_time_horizon(
-            durations=durations, required_gpus=required_gpus, submission_times=submission_times
-        )
-
-        # 4) Schedule all JOB_ARRIVAL events into the simulator.
-        self._schedule_job_arrivals(
-            durations=durations,
-            priorities=priorities,
-            required_gpus=required_gpus,
-            submission_times=submission_times,
-        )
-
-        # 5) Make reset() return a "real" initial queue (process arrivals at t=0).
-        self._drain_events_at_current_time()
+        # Total episode work (GPU-seconds), used to normalize rewards.
+        self.total_work_generated = float(np.sum(durations * required_gpus))
+        self._set_episode_time_horizon(durations, required_gpus, submission_times)
+        self._schedule_job_arrivals(durations, priorities, required_gpus, submission_times)
+        self._drain_events_at_current_time()  # include t=0 arrivals in initial obs
+        self._prev_time = float(self.simulator.current_time)
 
         return self._get_observation(), {
             "action_mask": self._get_action_mask(),
@@ -296,10 +291,7 @@ class SchedulerEnv(gym.Env):
         return np.clip(submission_times, 0.0, span).astype(np.float32)
 
     def _set_episode_time_horizon(
-        self,
-        durations: np.ndarray,
-        required_gpus: np.ndarray,
-        submission_times: np.ndarray,
+        self, durations: np.ndarray, required_gpus: np.ndarray, submission_times: np.ndarray
     ) -> None:
         """
         Set `max_episode_time` for this episode and update the simulator horizon.
@@ -376,23 +368,36 @@ class SchedulerEnv(gym.Env):
         - Determine `terminated` (natural end) vs `truncated` (time limit)
         - Produce the next observation and an updated action mask in `info`
         """
-        # Interpret action safely using the action mask (treat invalid actions as no-op)
-        action_mask = self._get_action_mask()
-        if action < 0 or action >= len(action_mask) or (action > 0 and not action_mask[action]):
-            action = 0
+        # Treat infeasible actions as no-op, but report them in info so training
+        # can log invalid-action ratios.
+        action_i = int(action)
+        action_mask = self._get_action_mask()  # shape: (max_queue_size + 1,)
+        had_feasible_job = bool(np.any(action_mask[1:]))
+        invalid_action = False
+        if action_i != 0:
+            # Any out-of-range or masked job choice is considered invalid.
+            if action_i < 0 or action_i >= int(action_mask.shape[0]):
+                invalid_action = True
+            elif not bool(action_mask[action_i]):
+                invalid_action = True
 
-        if action > 0:
+        effective_action = 0 if invalid_action else action_i
+
+        if effective_action > 0:
             job_queue = self.simulator.get_job_queue()
-            if 0 <= (action - 1) < len(job_queue):
-                self.simulator.schedule_job(job_queue[action - 1])
+            idx = effective_action - 1
+            if 0 <= idx < len(job_queue):
+                self.simulator.schedule_job(job_queue[idx])
 
         # Advance the simulator by one event if any exist. If the event queue is
         # empty, we do NOT treat that as an episode end by itself (it can happen
         # if the agent keeps no-op'ing while jobs are waiting).
+        prev_t = float(self.simulator.current_time)
         completed_jobs = []
         if self.simulator.event_queue:
             _, completed_jobs = self.simulator.step()
         job_completed = completed_jobs[0] if completed_jobs else None
+        dt = float(self.simulator.current_time) - prev_t
 
         self.step_count += 1
 
@@ -409,17 +414,26 @@ class SchedulerEnv(gym.Env):
         step_limit_hit = self.step_count >= self.max_episode_steps
         truncated = (time_limit_hit or step_limit_hit) and not terminated
 
-        reward, r_episode = self._calculate_reward(
-            job_completed=job_completed, episode_ended=terminated or truncated
+        took_noop = (effective_action == 0)
+        reward, r_terminal = self._calculate_reward(
+            job_completed=job_completed,
+            episode_ended=terminated or truncated,
+            took_noop=took_noop,
+            invalid_action=invalid_action,
+            dt=dt,
+            had_feasible_job=had_feasible_job,
+            terminated=terminated,
+            truncated=truncated,
         )
 
         obs = self._get_observation()
         info: Dict[str, Any] = {
             "action_mask": self._get_action_mask(),
             "max_episode_time": self.max_episode_time,
+            "invalid_action": invalid_action,
         }
         if terminated or truncated:
-            info["r_episode"] = r_episode
+            info["r_terminal"] = r_terminal
 
         return obs, reward, terminated, truncated, info
         
@@ -522,51 +536,70 @@ class SchedulerEnv(gym.Env):
         self,
         job_completed: Optional[Job] = None,
         episode_ended: bool = False,
+        took_noop: bool = False,
+        invalid_action: bool = False,
+        dt: float = 0.0,
+        had_feasible_job: bool = False,
+        terminated: bool = False,
+        truncated: bool = False,
     ) -> Tuple[float, float]:
         """
-        Compute the scalar reward for the current step.
+        Throughput-oriented reward (work-by-deadline) with an explicit incentive
+        to finish early.
 
-        The components and their intended roles are described in section 4
-        of the MDP spec (dense term, completion term, priority term,
-        and optional episode bonus).
-
-        Design this so that `step()` only needs to tell you "what happened"
-        (e.g. which job finished, whether the episode just ended) and the
-        arithmetic and weighting live here.
+        Returns (reward, terminal_component). terminal_component is 0.0 except
+        at episode end.
         """
-        # ---------------- reward components ----------------
-        #
-        # We keep reward magnitudes roughly stable as we scale the episode size.
-        # The dense penalty is normalized by total jobs so "400-job episodes"
-        # don't automatically become 20x more negative than "20-job episodes".
-        denom = max(1, int(self.total_jobs_generated))
-        queue_frac = len(self.simulator.get_job_queue()) / float(denom)
-        r_dense = -self.queue_penalty_scale * queue_frac
+        total_work = max(1e-9, float(self.total_work_generated))
 
-        r_completion = 0.0
-        r_priority = 0.0
-        r_episode = 0.0
+        # ---- helpers (work = GPU-seconds) ---------------------------------
+        def job_work(job: Job) -> float:
+            return float(job.estimated_duration) * float(job.required_gpus)
 
-        if job_completed:
-            # Work-based completion reward:
-            # reward ∝ (estimated_duration * required_gpus)
-            # Normalized to be comparable across jobs and cluster sizes.
-            work_norm = (
-                (float(job_completed.estimated_duration) / float(self.max_duration))
-                * (float(job_completed.required_gpus) / float(self.num_gpus))
-            )
-            r_completion = self.completion_work_scale * work_norm
-            r_priority = self.priority_bonus_scale * (
-                job_completed.get_state()["priority"] / self.max_priority
-            )
-        
+        # Available work = arrived jobs waiting + remaining work of running jobs.
+        queue_work = 0.0
+        for j in self.simulator.get_job_queue():
+            queue_work += float(j.estimated_duration) * float(j.required_gpus)
+
+        running_remaining_time = float(self._get_remaining_busy_times().sum()) * float(self.max_duration)
+        available_work = queue_work + running_remaining_time
+
+        # ---- step reward ---------------------------------------------------
+        r_progress = 0.0
+        if job_completed is not None:
+            r_progress = self.progress_scale * (job_work(job_completed) / total_work)
+
+        # Penalize carrying unfinished work over time (normalized by episode horizon).
+        # Uses dt so the magnitude corresponds to "area under remaining-work curve".
+        dt_frac = float(np.clip(dt / max(1e-9, float(self.max_episode_time)), 0.0, 10.0))
+        r_time_pressure = -self.time_pressure_scale * dt_frac * (available_work / total_work)
+
+        # Penalize no-op when there exists at least one feasible job action.
+        r_noop = 0.0
+        if took_noop and had_feasible_job and available_work > 0.0:
+            r_noop = -self.noop_penalty_scale * (available_work / total_work)
+
+        r_terminal = 0.0
         if episode_ended:
-            metrics = self.simulator.get_metrics()
-            completion_rate = float(metrics["jobs_completed"]) / float(denom)
-            r_episode = self.episode_bonus_scale * completion_rate
+            # Finishing early is good: reward leftover time fraction.
+            if terminated:
+                time_left = max(0.0, float(self.max_episode_time) - float(self.simulator.current_time))
+                r_terminal = self.early_finish_bonus_scale * (
+                    time_left / max(1e-9, float(self.max_episode_time))
+                )
+            # Missing the deadline is bad: penalize unfinished total work fraction.
+            elif truncated:
+                future_arrival_work = 0.0
+                for ev in self.simulator.event_queue:
+                    if getattr(ev, "event_type", None) == EventType.JOB_ARRIVAL:
+                        jb = getattr(ev, "data", {}).get("job", None)
+                        if isinstance(jb, Job):
+                            future_arrival_work += job_work(jb)
+                unfinished_work = available_work + future_arrival_work
+                r_terminal = -self.deadline_miss_penalty_scale * (unfinished_work / total_work)
 
-        r_total = r_dense + r_completion + r_priority + r_episode
-        return r_total, r_episode
+        r_total = float(r_progress + r_time_pressure + r_noop + r_terminal)
+        return r_total, float(r_terminal)
 
     def render(self) -> None:
         """
