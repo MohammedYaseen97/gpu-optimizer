@@ -28,6 +28,11 @@ from src.agents.value_net import ValueNetwork
 class PPOConfig:
     """Hyperparameters for PPO."""
 
+    # Policy architecture for ablations.
+    # - "attn": cross-attention (jobs attend to GPUs)
+    # - "mlp":  simple 2-layer MLP (pre-attention baseline)
+    policy_arch: str = "attn"
+
     total_timesteps: int = 100_000
     num_steps: int = 256            # rollout length per update
     gamma: float = 0.99
@@ -74,7 +79,11 @@ class PPOAgent(BaseAgent):
         self.obs_dim = env.observation_space.shape[0]
         self.act_dim = env.action_space.n
 
-        self.policy = PolicyNetwork(state_dim=self.obs_dim, action_dim=self.act_dim)
+        self.policy = PolicyNetwork(
+            state_dim=self.obs_dim,
+            action_dim=self.act_dim,
+            arch=str(self.config.policy_arch),
+        )
         self.value_fn = ValueNetwork(state_dim=self.obs_dim)
 
         self.optimizer = optim.Adam(
@@ -93,6 +102,41 @@ class PPOAgent(BaseAgent):
                 self._eval_env = SchedulerEnv(**getattr(env, "_init_kwargs"))
             except Exception:
                 self._eval_env = None
+
+        # Best-checkpoint tracking (for "best eval checkpoint" reporting).
+        self.best_eval_mean_return: float = float("-inf")
+        self.best_eval_update: int = -1
+        self.best_checkpoint_path: Optional[str] = None
+
+    def save_checkpoint(self, path: str) -> None:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        torch.save(
+            {
+                "policy_state_dict": self.policy.state_dict(),
+                "value_state_dict": self.value_fn.state_dict(),
+                # NOTE: Do NOT store config as a custom class object here.
+                # PyTorch 2.6+ defaults `torch.load(..., weights_only=True)` which
+                # rejects unpickling custom classes unless allowlisted. We keep the
+                # checkpoint tensor-only so it can be loaded safely by default.
+                "checkpoint_version": 1,
+            },
+            path,
+        )
+
+    def load_checkpoint(self, path: str) -> None:
+        # PyTorch 2.6+ defaults `weights_only=True` which is safer but will fail
+        # to load older checkpoints that accidentally pickled custom classes.
+        # We fall back to `weights_only=False` only if needed.
+        try:
+            ckpt = torch.load(path, map_location=self.device)
+        except Exception:
+            try:
+                ckpt = torch.load(path, map_location=self.device, weights_only=False)
+            except TypeError:
+                # Older torch versions may not support the kwarg.
+                ckpt = torch.load(path, map_location=self.device)
+        self.policy.load_state_dict(ckpt["policy_state_dict"])
+        self.value_fn.load_state_dict(ckpt["value_state_dict"])
 
     def _reset_train_env(self):
         """Reset env for training with a deterministic, rolling seed schedule."""
@@ -567,6 +611,16 @@ class PPOAgent(BaseAgent):
                 # Track best eval points.
                 if eval_mean_return > best_eval_mean[0]:
                     best_eval_mean = (eval_mean_return, update, timesteps)
+                    self.best_eval_mean_return = float(eval_mean_return)
+                    self.best_eval_update = int(update)
+                    if log_csv_path is not None:
+                        ckpt_dir = os.path.join(os.path.dirname(log_csv_path) or ".", "checkpoints")
+                        ckpt_path = os.path.join(
+                            ckpt_dir,
+                            os.path.basename(log_csv_path).replace(".csv", "") + "_best.pt",
+                        )
+                        self.save_checkpoint(ckpt_path)
+                        self.best_checkpoint_path = ckpt_path
                 if eval_min_block_return > best_eval_minblock[0]:
                     best_eval_minblock = (eval_min_block_return, update, timesteps)
 

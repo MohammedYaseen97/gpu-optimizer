@@ -73,46 +73,6 @@ PRESETS: dict[str, PPOPreset] = {
         train_seed_base=1_000_000,
         eval_seed_base=2_000_000,
     ),
-    # Slower updates: useful for finding runs where best eval happens later.
-    "slow_updates": PPOPreset(
-        num_steps=2048,
-        gamma=0.99,
-        gae_lambda=0.95,
-        num_minibatches=8,
-        update_epochs=1,
-        clip_coef=0.1,
-        ent_coef=0.01,
-        vf_coef=0.5,
-        max_grad_norm=0.5,
-        normalize_advantages=True,
-        learning_rate=5e-5,
-        lr_schedule="exp",
-        lr_exp_end_frac=0.3,
-        entropy_jump_clip=0.5,
-        target_kl=0.01,
-        train_seed_base=1_000_000,
-        eval_seed_base=2_000_000,
-    ),
-    # Slightly more exploration.
-    "more_exploration": PPOPreset(
-        num_steps=2048,
-        gamma=0.99,
-        gae_lambda=0.95,
-        num_minibatches=8,
-        update_epochs=2,
-        clip_coef=0.1,
-        ent_coef=0.02,
-        vf_coef=0.5,
-        max_grad_norm=0.5,
-        normalize_advantages=True,
-        learning_rate=1e-4,
-        lr_schedule="exp",
-        lr_exp_end_frac=0.2,
-        entropy_jump_clip=0.5,
-        target_kl=0.02,
-        train_seed_base=1_000_000,
-        eval_seed_base=2_000_000,
-    ),
 }
 
 DEFAULT_PRESET = "baseline_stable"
@@ -124,6 +84,31 @@ def parse_args() -> argparse.Namespace:
     # Training (experiment-level)
     parser.add_argument("--total-timesteps", type=int, default=200_000)
     parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument(
+        "--preset",
+        type=str,
+        default=DEFAULT_PRESET,
+        choices=sorted(PRESETS.keys()),
+        help="PPO hyperparameter preset (keeps CLI manageable).",
+    )
+    # Ablations / research toggles (defaults match the final config)
+    parser.add_argument(
+        "--policy-arch",
+        type=str,
+        default="attn",
+        choices=["attn", "mlp"],
+        help="Policy architecture ablation: attn (cross-attn) vs mlp (baseline).",
+    )
+    parser.add_argument(
+        "--lookahead-mode",
+        type=str,
+        default="per_gpu",
+        choices=["off", "per_gpu", "sorted", "cdf"],
+        help=(
+            "Lookahead representation (keeps observation shape unchanged). "
+            "'off' zeros the lookahead segment."
+        ),
+    )
 
     # Env config
     parser.add_argument("--num-gpus", type=int, default=8)
@@ -157,12 +142,18 @@ def parse_args() -> argparse.Namespace:
         default=1,
         help="1 = greedy argmax eval (stable curves), 0 = stochastic sampling",
     )
+    parser.add_argument(
+        "--report-seed-offset",
+        type=int,
+        default=10_000_000,
+        help="Offset added to VAL eval seed base for disjoint REPORT evaluation.",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    preset = PRESETS[DEFAULT_PRESET]
+    preset = PRESETS[str(args.preset)]
 
     # Seeding
     np.random.seed(args.seed)
@@ -184,10 +175,12 @@ def main() -> None:
         noop_penalty_scale=0.05,
         early_finish_bonus_scale=1.0,
         deadline_miss_penalty_scale=1.0,
+        lookahead_mode=str(args.lookahead_mode),
     )
 
     # Build PPOConfig from experiment args + hardcoded preset
     config = PPOConfig(
+        policy_arch=str(args.policy_arch),
         total_timesteps=args.total_timesteps,
         num_steps=preset.num_steps,
         gamma=preset.gamma,
@@ -215,7 +208,13 @@ def main() -> None:
     log_dir = "runs"
     os.makedirs(log_dir, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_name = f"ppo_{DEFAULT_PRESET}_{args.jobs_per_episode}jobs_w{args.max_queue_size}_seed{args.seed}_{ts}"
+    mode = str(args.lookahead_mode).strip()
+    tag_mode = "pergpu" if mode == "per_gpu" else mode
+    lookahead_tag = f"lookahead_{tag_mode}"
+    run_name = (
+        f"ppo_{args.preset}_arch{args.policy_arch}_{lookahead_tag}_"
+        f"{args.jobs_per_episode}jobs_w{args.max_queue_size}_seed{args.seed}_{ts}"
+    )
     csv_path = os.path.join(log_dir, f"{run_name}.csv")
 
     # Train PPO
@@ -226,28 +225,59 @@ def main() -> None:
         eval_deterministic=bool(int(args.eval_deterministic)),
     )
 
-    # Simple post-training evaluation (deterministic episodes).
-    # Match the periodic eval seed schedule used inside PPOAgent.train():
-    #   base = eval_seed_base + seed
-    # so this number is directly comparable to the logged eval curve.
+    # Best-checkpoint reporting: if we saved a best-eval checkpoint during training,
+    # evaluate THAT policy rather than the final iterate.
+    best_ckpt = getattr(agent, "best_checkpoint_path", None)
+    if best_ckpt:
+        agent.load_checkpoint(best_ckpt)
+        print(
+            f"[PPO] Loaded best checkpoint from update={getattr(agent, 'best_eval_update', -1)} "
+            f"eval_mean_return={getattr(agent, 'best_eval_mean_return', float('nan')):.3f}"
+        )
+
+    # Post-training evaluation (deterministic episodes).
+    #
+    # We compute TWO numbers:
+    # - VAL: same fixed seeds used for periodic eval (comparable to the training curve; used for selection)
+    # - REPORT: disjoint fixed seeds (final reported number; reduces "tuned-on-eval" bias)
     num_eval_episodes = int(args.num_eval_episodes)
-    rewards = []
-    invalid_fracs = []
-    noop_fracs = []
-    eval_seed_base = int(preset.eval_seed_base) + int(args.seed)
+    val_rewards = []
+    val_invalid_fracs = []
+    val_noop_fracs = []
+    val_seed_base = int(preset.eval_seed_base) + int(args.seed)
     for ep in range(num_eval_episodes):
         stats = agent.run_episode_with_stats(
-            seed=eval_seed_base + ep, deterministic=bool(int(args.eval_deterministic))
+            seed=val_seed_base + ep, deterministic=bool(int(args.eval_deterministic))
         )
-        rewards.append(stats["total_reward"])
-        invalid_fracs.append(stats["invalid_frac"])
-        noop_fracs.append(stats["noop_frac"])
+        val_rewards.append(stats["total_reward"])
+        val_invalid_fracs.append(stats["invalid_frac"])
+        val_noop_fracs.append(stats["noop_frac"])
 
-    avg_reward = float(np.mean(rewards))
-    avg_invalid = float(np.mean(invalid_fracs))
-    avg_noop = float(np.mean(noop_fracs))
-    print(f"[PPO] Avg total reward over {num_eval_episodes} eval episodes: {avg_reward:.3f}")
-    print(f"[PPO] Eval invalid_frac={avg_invalid:.3f}  noop_frac={avg_noop:.3f}")
+    val_avg_reward = float(np.mean(val_rewards))
+    val_avg_invalid = float(np.mean(val_invalid_fracs))
+    val_avg_noop = float(np.mean(val_noop_fracs))
+    print(f"[PPO][VAL] Avg total reward over {num_eval_episodes} eval episodes: {val_avg_reward:.3f}")
+    print(f"[PPO][VAL] invalid_frac={val_avg_invalid:.3f}  noop_frac={val_avg_noop:.3f}  seed_base={val_seed_base}")
+
+    report_rewards = []
+    report_invalid_fracs = []
+    report_noop_fracs = []
+    report_seed_base = int(preset.eval_seed_base) + int(args.seed) + int(args.report_seed_offset)
+    for ep in range(num_eval_episodes):
+        stats = agent.run_episode_with_stats(
+            seed=report_seed_base + ep, deterministic=bool(int(args.eval_deterministic))
+        )
+        report_rewards.append(stats["total_reward"])
+        report_invalid_fracs.append(stats["invalid_frac"])
+        report_noop_fracs.append(stats["noop_frac"])
+
+    report_avg_reward = float(np.mean(report_rewards))
+    report_avg_invalid = float(np.mean(report_invalid_fracs))
+    report_avg_noop = float(np.mean(report_noop_fracs))
+    print(f"[PPO][REPORT] Avg total reward over {num_eval_episodes} eval episodes: {report_avg_reward:.3f}")
+    print(
+        f"[PPO][REPORT] invalid_frac={report_avg_invalid:.3f}  noop_frac={report_avg_noop:.3f}  seed_base={report_seed_base}"
+    )
     print(f"[PPO] Training curve CSV: {csv_path}")
 
 

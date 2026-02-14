@@ -1,22 +1,24 @@
 """
-Policy network skeleton (PyTorch).
+Policy networks (PyTorch).
 
-This will map flattened state observations to action probabilities
-over the discrete action space of `SchedulerEnv`.
+We keep two architectures here so we can do clean ablations:
+- cross-attention policy (jobs attend to GPUs)  [current approach]
+- simple 2-layer MLP                            [previous baseline]
 """
 
+import math
 import torch
 import torch.nn as nn
-import math
+import torch.nn.functional as F
 
 
-class PolicyNetwork(nn.Module):
+class CrossAttentionPolicyNetwork(nn.Module):
     """
     Cross-attention policy (jobs attend to GPUs).
 
     Observation layout (from `SchedulerEnv`):
-    - jobs:  max_queue_size * 4  (duration, priority, req_gpus, waiting_time)
-    - gpus:  num_gpus * 1        (remaining busy time per GPU)
+    - jobs:   max_queue_size * 4  (duration, priority, req_gpus, waiting_time)
+    - gpus:   num_gpus * 1        (remaining busy time per GPU)
     - global: 2                  (idle_ratio, busy_ratio)
 
     Output:
@@ -80,7 +82,6 @@ class PolicyNetwork(nn.Module):
         self.job_head = nn.Linear(d, 1)  # per-job logit
         # No-op logit is produced through the SAME scoring head as jobs.
         # This avoids the "separate noop MLP dominates everything" failure mode.
-        # We still allow a small bias toward scheduling by initializing this negative.
         self.noop_bias = nn.Parameter(torch.tensor(-1.0))
 
     def _split_obs(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -121,14 +122,12 @@ class PolicyNetwork(nn.Module):
         job_logits = self.job_head(job_ctx).squeeze(-1)  # (B, N)
 
         # No-op logit: build a single "noop token" and score it with `job_head`.
-        # The noop token can attend to GPUs (like jobs do) and gets global context.
         job_pool = job_ctx.mean(dim=1)  # (B, d)
         gpu_pool = gpu_emb.mean(dim=1)  # (B, d)
         noop_base = (job_pool + gpu_pool + global_emb) / 3.0  # (B, d)
         noop_base = noop_base.unsqueeze(1)  # (B, 1, d)
 
         Q0 = self.Wq(noop_base)  # (B, 1, d)
-        # Reuse K,V computed for GPUs
         attn_scores0 = torch.matmul(Q0, K.transpose(1, 2)) / math.sqrt(self.d_model)  # (B, 1, G)
         attn_weights0 = torch.softmax(attn_scores0, dim=-1)
         ctx0 = torch.matmul(attn_weights0, V)  # (B, 1, d)
@@ -140,5 +139,47 @@ class PolicyNetwork(nn.Module):
 
         logits = torch.cat([noop_logit, job_logits], dim=1)  # (B, 1+N)
         return logits
+
+
+class MLPPolicyNetwork(nn.Module):
+    """Simple 2-layer MLP policy (pre-attention baseline)."""
+
+    def __init__(self, state_dim: int, action_dim: int, hidden_dim: int = 128):
+        super().__init__()
+        self.fc1 = nn.Linear(state_dim, hidden_dim)
+        self.fc2 = nn.Linear(hidden_dim, hidden_dim)
+        self.out = nn.Linear(hidden_dim, action_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        return self.out(x)
+
+
+class PolicyNetwork(nn.Module):
+    """Wrapper that selects between attention and MLP architectures."""
+
+    def __init__(
+        self,
+        state_dim: int,
+        action_dim: int,
+        hidden_dim: int = 128,
+        arch: str = "attn",
+    ):
+        super().__init__()
+        a = str(arch).lower().strip()
+        if a in {"attn", "attention", "cross_attn", "cross-attn"}:
+            self.impl = CrossAttentionPolicyNetwork(
+                state_dim=state_dim, action_dim=action_dim, hidden_dim=hidden_dim
+            )
+        elif a in {"mlp", "baseline_mlp", "simple"}:
+            self.impl = MLPPolicyNetwork(
+                state_dim=state_dim, action_dim=action_dim, hidden_dim=hidden_dim
+            )
+        else:
+            raise ValueError(f"Unknown PolicyNetwork arch={arch!r}. Use 'attn' or 'mlp'.")
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.impl(x)
 
 

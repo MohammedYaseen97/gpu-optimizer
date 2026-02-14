@@ -35,6 +35,12 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     # Experiment-level
     p.add_argument("--seed", type=int, default=1)
+    p.add_argument(
+        "--seed-offset",
+        type=int,
+        default=0,
+        help="Offset added to the baseline fixed seed base (useful for REPORT vs VAL comparisons).",
+    )
 
     # Env config
     p.add_argument("--num-gpus", type=int, default=8)
@@ -49,6 +55,13 @@ def parse_args() -> argparse.Namespace:
     # Eval config (match PPO multi-block eval)
     p.add_argument("--eval-episodes", type=int, default=20)
     p.add_argument("--eval-num-blocks", type=int, default=3)
+    p.add_argument(
+        "--lookahead-mode",
+        type=str,
+        default="per_gpu",
+        choices=["off", "per_gpu", "sorted", "cdf"],
+        help="Lookahead representation (keeps observation shape unchanged). 'off' zeros the segment.",
+    )
     return p.parse_args()
 
 
@@ -129,6 +142,7 @@ def main() -> None:
         "horizon_factor": args.horizon_factor,
         # Reward (fixed; keep apples-to-apples with PPO runner)
         **REWARD_KWARGS,
+        "lookahead_mode": str(args.lookahead_mode),
     }
 
     agents = {
@@ -138,7 +152,7 @@ def main() -> None:
     }
 
     # Fixed-seed blocks for robustness, same idea as PPO's multi-block eval.
-    base = int(EVAL_SEED_BASE) + int(args.seed)
+    base = int(EVAL_SEED_BASE) + int(args.seed) + int(args.seed_offset)
     num_blocks = int(max(1, args.eval_num_blocks))
     block_size = int(args.eval_episodes)
 

@@ -82,6 +82,12 @@ class SchedulerEnv(gym.Env):
         noop_penalty_scale: float = 0.05,
         early_finish_bonus_scale: float = 1.0,
         deadline_miss_penalty_scale: float = 1.0,
+        # Lookahead representation mode (keeps observation shape unchanged):
+        # - "off":    disable lookahead (segment is all zeros)
+        # - "per_gpu": current vector of per-GPU remaining busy times
+        # - "sorted": permutation-invariant sort(per_gpu)
+        # - "cdf":    permutation-invariant CDF over uniform time thresholds
+        lookahead_mode: str = "per_gpu",
         debug: bool = False,
         # (unused) Accept extra kwargs so scripts can pass through safely.
         **_: Any,
@@ -129,6 +135,12 @@ class SchedulerEnv(gym.Env):
         self.noop_penalty_scale = float(noop_penalty_scale)
         self.early_finish_bonus_scale = float(early_finish_bonus_scale)
         self.deadline_miss_penalty_scale = float(deadline_miss_penalty_scale)
+        self.lookahead_mode = str(lookahead_mode).strip()
+        if self.lookahead_mode not in {"off", "per_gpu", "sorted", "cdf"}:
+            raise ValueError(
+                f"Unknown lookahead_mode={lookahead_mode!r}. Use one of: "
+                f"'off', 'per_gpu', 'sorted', 'cdf'."
+            )
         
         # Observation layout:
         # - job window: max_queue_size * 4
@@ -467,12 +479,32 @@ class SchedulerEnv(gym.Env):
             )
             obs[base + 3] = np.clip(wt, 0.0, 1.0)
 
-        # Novelty: per-GPU remaining busy time (look-ahead signal).
-        # Normalized by max_duration so it is directly comparable to the
-        # normalized job durations in the queue window.
-        rem = self._get_remaining_busy_times()  # (num_gpus,)
+        # Novelty: look-ahead signal derived from per-GPU remaining busy times.
+        #
+        # We keep the observation shape unchanged (length = num_gpus), but we can
+        # change the *representation* to something more permutation-invariant /
+        # model-friendly.
+        mode = self.lookahead_mode
+        if mode == "off":
+            rem_feat = np.zeros(self.num_gpus, dtype=np.float32)
+        else:
+            rem = self._get_remaining_busy_times()  # (num_gpus,) in [0,1]
+            if mode == "per_gpu":
+                rem_feat = rem
+            elif mode == "sorted":
+                rem_feat = np.sort(rem).astype(np.float32, copy=False)
+            elif mode == "cdf":
+                # Uniform thresholds in normalized time (exclude 0.0 to keep length=num_gpus)
+                # tau[j] = (j+1)/G for j=0..G-1
+                G = int(self.num_gpus)
+                taus = (np.arange(1, G + 1, dtype=np.float32) / float(G)).astype(np.float32)
+                # cdf[j] = fraction of GPUs free within tau[j]
+                rem_feat = np.array([(rem <= t).mean() for t in taus], dtype=np.float32)
+            else:
+                # Should be unreachable due to validation in __init__.
+                rem_feat = rem
         rem_start = self.max_queue_size * 4
-        obs[rem_start : rem_start + self.num_gpus] = rem
+        obs[rem_start : rem_start + self.num_gpus] = rem_feat
 
         idle_ratio = self.simulator.cluster.get_idle_count() / self.num_gpus
         busy_ratio = self.simulator.cluster.get_busy_count() / self.num_gpus
