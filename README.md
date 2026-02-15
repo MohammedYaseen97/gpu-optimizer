@@ -1,6 +1,6 @@
 # GPU Scheduler (PPO vs Heuristics)
 
-This repo implements a **GPU job scheduling environment** (discrete-event simulation wrapped as a Gymnasium MDP), **heuristic baselines** (FIFO/SJF/Priority), and a **PPO agent** trained to learn scheduling policies.
+This repo implements a **GPU job scheduling environment** (discrete-event simulation wrapped as a Gymnasium MDP), **heuristic baselines** (FIFO/SJF/random-feasible), and a **PPO agent** trained to learn scheduling policies.
 
 This README focuses on **what the system is** and **how to run it**.  
 Results and ablations live in a separate markdown file (see `docs/`).
@@ -15,12 +15,20 @@ Results and ablations live in a separate markdown file (see `docs/`).
   - Workloads: bursty arrivals; configurable job attribute distributions (including heavy-tailed durations + correlations)
   - Truncation: per-episode time horizon (workload-aware) and/or step limit
 - **Baselines**: `src/agents/baselines/`
-  - FIFO, SJF, Priority heuristics
+  - FIFO, SJF, and `RAND_FEAS_NO0` (random feasible non-noop)
 - **PPO**: `src/agents/ppo_agent.py`, training script: `scripts/train_ppo.py`
   - On-policy rollouts + clipped PPO update + value function
   - CSV logging for learning curves + plotting script
-- **(Novelty-ready) Look-ahead signal**:
-  - Observation can include a vector of **per-GPU remaining busy time** (normalized), which helps the policy reason about near-future capacity.
+- **Lookahead signal (multiple modes)**:
+  - `lookahead_mode ∈ {off, per_gpu, sorted, cdf}` keeps the observation shape unchanged while changing the representation of future GPU availability.
+  - See `docs/final_results.md` for the ablation table and discussion.
+
+---
+
+## Research novelties (ours)
+
+- **Lookahead observation + modality design**: we include a future-capacity signal derived from per-GPU remaining busy time, and we study **how to represent it** (`per_gpu` vs `sorted` vs `cdf` vs `off`) while keeping observation shape fixed. Implemented in `src/environment/scheduler_env.py`.
+- **Cross-attention policy network**: PPO policy that scores jobs using cross-attention over GPU tokens (baseline is a standard flat **MLP** policy). Implemented in `src/agents/policy_net.py`.
 
 ---
 
@@ -38,7 +46,8 @@ gpu-scheduler/
 │   ├── train_ppo.py
 │   └── plot_training_curve.py
 ├── docs/
-│   └── mdp_spec.md
+│   ├── mdp_spec.md
+│   └── final_results.md
 └── runs/                   # Training CSVs/plots
 ```
 
@@ -70,7 +79,13 @@ PYTHONPATH=. python scripts/...
 
 ```bash
 source virtual/bin/activate
-PYTHONPATH=. python scripts/evaluate_baselines.py --num-episodes 10 --seed 1
+PYTHONPATH=. python scripts/evaluate_baselines.py \
+  --seed 1 \
+  --jobs-per-episode 400 \
+  --max-queue-size 50 \
+  --eval-num-blocks 3 \
+  --eval-episodes 20 \
+  --lookahead-mode off
 ```
 
 You can also override environment scale parameters (see `scripts/evaluate_baselines.py --help`), e.g.:
@@ -80,7 +95,8 @@ PYTHONPATH=. python scripts/evaluate_baselines.py \
   --jobs-per-episode 400 \
   --max-queue-size 50 \
   --arrival-mode bursty \
-  --horizon-factor 1.25
+  --horizon-factor 1.25 \
+  --lookahead-mode per_gpu
 ```
 
 ---
@@ -90,15 +106,19 @@ PYTHONPATH=. python scripts/evaluate_baselines.py \
 ```bash
 source virtual/bin/activate
 PYTHONPATH=. python scripts/train_ppo.py \
+  --preset baseline_stable \
+  --policy-arch attn \
+  --lookahead-mode cdf \
   --total-timesteps 200000 \
   --jobs-per-episode 400 \
   --max-queue-size 50 \
-  --arrival-mode bursty \
-  --horizon-factor 1.25 \
-  --run-name my_run
+  --arrival-mode bursty
 ```
 
-This will write a CSV to `runs/my_run.csv` with training stats and periodic eval returns.
+This writes:
+- a training curve CSV under `runs/`
+- best checkpoints under `runs/checkpoints/` (saved during training based on periodic VAL eval)
+It also prints final **VAL** and **REPORT** scores at the end.
 
 ---
 
@@ -114,5 +134,5 @@ PYTHONPATH=. python scripts/plot_training_curve.py runs/my_run.csv --out runs/my
 ## Documentation
 
 - **MDP spec**: `docs/mdp_spec.md` (state/action/reward/termination, aligned to implementation)
-- **Results / ablations**: keep in a separate markdown file under `docs/` (not included in this README)
+- **Results / ablations**: `docs/final_results.md`
 
